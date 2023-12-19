@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.4
+FROM switchboardlabs/sgx-function AS builder
+
+# install protoc compiler
+# RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
+#     --mount=type=cache,id=apt-lib,target=/var/lib/apt,sharing=locked \
+#     --mount=type=cache,id=debconf,target=/var/cache/debconf,sharing=locked \
+#     set -exu && \
+#     DEBIAN_FRONTEND=noninteractive apt update && \
+#     apt -y --no-install-recommends install \
+#     protobuf-compiler 
+
+
+# First copy the anchor program so we can re-use the type definitions
+WORKDIR /home/root/basic-oracle-example
+COPY ./Cargo.lock ./Cargo.lock
+WORKDIR /home/root/basic-oracle-example/programs/usdy_usdc_oracle
+COPY ./programs /home/root/basic-oracle-example/programs
+COPY ./deps /home/root/basic-oracle-example/deps
+
+
+WORKDIR /home/root/basic-oracle-example/switchboard-functions/jupiter-searcher
+COPY ./switchboard-functions/jupiter-searcher/Cargo.toml \
+     ./
+COPY ./switchboard-functions/jupiter-searcher/src/ ./src/
+COPY ./switchboard-functions/jupiter-searcher/sdk/ ./sdk/
+COPY ./switchboard-functions/jupiter-searcher/switchboard-common ./switchboard-common
+COPY ./switchboard-functions/jupiter-searcher/switchboard-solana ./switchboard-solana
+COPY ./switchboard-functions/jupiter-searcher/switchboard-solana-macros ./switchboard-solana-macros
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=${TARGETPLATFORM} \
+    --mount=type=cache,target=target,id=${TARGETPLATFORM} \
+    cargo build --release && \
+    cargo strip && \
+    mv target/release/balancer-oracle-function /sgx/app
+
+FROM switchboardlabs/sgx-function
+
+# Copy the binary
+WORKDIR /sgx
+COPY --from=builder /sgx/app /sgx
+COPY ./switchboard-functions/jupiter-searcher/config/app.manifest.template /sgx/app.manifest.template
+
+# Get the measurement from the enclave
+RUN rm -f /measurement.txt && \
+    /get_measurement.sh && \
+    cat /measurement.txt
+
+ENTRYPOINT ["bash", "/boot.sh"]

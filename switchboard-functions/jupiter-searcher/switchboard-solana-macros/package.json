@@ -1,0 +1,9 @@
+{
+  "name": "switchboard-solana-macros",
+  "scripts": {
+    "cargo:build": "cargo build --features all",
+    "lint": "cargo fmt -- --check",
+    "fix": "cargo fmt",
+    "broken:test": "cargo test --features all -- --nocapture"
+  }
+}

@@ -1,0 +1,9 @@
+[features]
+seeds = false
+skip-lint = false
+[workspace]
+members = ["programs/jupiter_searcher"]
+
+[provider]
+cluster = "Devnet"
+wallet = "~/.config/solana/id.json"
