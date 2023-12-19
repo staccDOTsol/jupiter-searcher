@@ -2,9 +2,10 @@ extern crate proc_macro;
 
 mod params;
 mod utils;
+
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{GenericArgument, PathArguments, Type, FnArg, ItemFn, Result as SynResult, ReturnType};
+use syn::{FnArg, ItemFn, Result as SynResult, ReturnType, Type};
 
 #[proc_macro_attribute]
 pub fn switchboard_function(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -168,25 +169,21 @@ fn validate_function_return_type(input: &ItemFn) -> SynResult<()> {
     let (ok_type, err_type) = utils::extract_result_args(ty).ok_or_else(|| {
         syn::Error::new_spanned(&input.sig.output, "Return type must be a Result")
     })?;
-/*
+
     // Validate the inner Vec type
-    let inner_vec_type = utils::extract_inner_type_from_vec(inner_sb_type).ok_or_else(|| {
+    let inner_vec_type = utils::extract_inner_type_from_vec(ok_type).ok_or_else(|| {
         syn::Error::new_spanned(
             &input.sig.output,
-            "Ok variant of SbFunctionResult must be Vec<Instruction>"
+            "Ok variant of Result must be a Vec<Instruction>",
         )
     })?;
 
     if !matches!(inner_vec_type, Type::Path(t) if t.path.is_ident("Instruction")) {
         return Err(syn::Error::new_spanned(
             &input.sig.output,
-            "Ok variant of Result must be a (Vec<Instruction>,
-                    Option<CommitmentConfig>,
-                    Option<u64>,
-                    Option<u32>,
-                    Option<Vec<AddressLookupTableAccount>>)",
+            "Ok variant of Result must be a Vec<Instruction>",
         ));
-    } 
+    }
 
     // Validate the error type
     let error_type_path_segments = match err_type {
@@ -198,6 +195,7 @@ fn validate_function_return_type(input: &ItemFn) -> SynResult<()> {
             ));
         }
     };
+
     // Check if the error type is SbFunctionError or switchboard_common::SbFunctionError
     let is_sb_function_error = match error_type_path_segments.last() {
         Some(last_segment) if last_segment.ident == "SbFunctionError" => true,
@@ -216,7 +214,6 @@ fn validate_function_return_type(input: &ItemFn) -> SynResult<()> {
             "The error variant in the Result return type should be SbFunctionError",
         ));
     }
-*/
 
     Ok(())
 }
@@ -238,7 +235,7 @@ fn validate_second_parameter(input: &ItemFn) -> SynResult<()> {
             ));
         }
     };
-    
+
     // Use the utility function to extract the inner type from a Vec
     let inner_type = utils::extract_inner_type_from_vec(&typed_arg.ty).ok_or_else(|| {
         syn::Error::new_spanned(
@@ -282,6 +279,13 @@ fn build_token_stream(
         );
     }
 
+    validate_function_return_type(&input)?;
+
+    // Validate input parameters
+    // validate_function_runner_param_arc(&input)?;
+    validate_function_runner_param(&input)?;
+    validate_second_parameter(&input)?;
+
     let expanded = quote! {
             use switchboard_solana::prelude::*;
 
@@ -289,14 +293,14 @@ fn build_token_stream(
             #input
 
             pub type SwitchboardFunctionResult<T> = std::result::Result<T, SbFunctionError>;
-
+        
             /// Run an async function and catch any panics
             pub async fn run_switchboard_function<F, T>(
                 logic: F,
             ) -> SwitchboardFunctionResult<()>
             where
                 F: Fn(FunctionRunner, Vec<u8>) -> T + Send + 'static,
-                T: futures::Future<Output = SwitchboardFunctionResult<SbFunctionResult>>
+                T: futures::Future<Output = SwitchboardFunctionResult<Vec<Instruction>>>
                     + Send,
             {
                 // Initialize the runner
@@ -310,15 +314,8 @@ fn build_token_stream(
                 
                 match logic(runner.clone(), params).await {
                     Ok(ixs) => {
-                        let sb_function_result: SbFunctionResult = SbFunctionResult {
-                            ixs: ixs.clone(),
-                            commitment: Some(CommitmentConfig::confirmed()),
-                            priority_fee: None,
-                            compute_limit: None,
-                            address_lookup_table_accounts: None,
-                        };
                         runner
-                            .emit(sb_function_result)
+                            .emit(ixs)
                             .await
                             .map_err(|_e| SbFunctionError::FunctionResultEmitError)?;
 
@@ -346,7 +343,7 @@ fn build_token_stream(
             ) -> SwitchboardFunctionResult<()>
             where
                 F: Fn(FunctionRunner, Vec<u8>) -> T + Send + 'static,
-                T: futures::Future<Output = SwitchboardFunctionResult<SbFunctionResult>>
+                T: futures::Future<Output = SwitchboardFunctionResult<Vec<Instruction>>>
                     + Send,
             {
                 // Initialize the runner
@@ -360,14 +357,7 @@ fn build_token_stream(
 
                 match logic(runner.clone(), params).await {
                     Ok(ixs) => {
-                        let sb_function_result: SbFunctionResult = SbFunctionResult {
-                            ixs: ixs.clone(),
-                            commitment: Some(CommitmentConfig::confirmed()),
-                            priority_fee: None,
-                            compute_limit: None,
-                            address_lookup_table_accounts: None,
-                        };
-                        match runner.get_function_result(sb_function_result, 0).await {
+                        match runner.get_function_result(ixs.clone(), 0).await {
                             Ok(function_result) => {
                                 let serialized_output = format!(
                                     "{}{}",

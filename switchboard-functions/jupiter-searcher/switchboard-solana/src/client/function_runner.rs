@@ -1,13 +1,12 @@
 use crate::prelude::*;
 use anchor_client::solana_sdk::compute_budget::ComputeBudgetInstruction;
-use anchor_lang::solana_program::instruction::{Instruction};
-use anchor_lang::solana_program::message::{VersionedMessage, v0};
+use anchor_client::solana_sdk::signer::Signer;
+use anchor_lang::solana_program::instruction::Instruction;
 use anchor_lang::solana_program::pubkey::Pubkey;
-use solana_program::address_lookup_table::AddressLookupTableAccount;
-use anchor_client::solana_sdk::signature::Signer;
 use anchor_lang::AnchorDeserialize;
 use sgx_quote::Quote;
 use solana_client::rpc_client::RpcClient;
+use solana_program::message::{VersionedMessage, v0};
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signer::keypair::Keypair;
 use std::result::Result;
@@ -17,13 +16,42 @@ use solana_sdk::account::Account;
 
 use switchboard_common::SolanaFunctionEnvironment;
 use switchboard_common::{ChainResultInfo::Solana, SolanaFunctionResult};
-#[derive(Debug, Clone)]
-pub struct SbFunctionResult {
-    pub ixs: Vec<Instruction>,
+use syn::parse::{Parse, ParseStream, Result as ParseResult};
+use syn::punctuated::Punctuated;
+use syn::{ExprAssign, Token};
+use solana_program::address_lookup_table::AddressLookupTableAccount;
+
+#[derive(Default, Debug, Clone)]
+pub enum SolanaParamsEncoding {
+    #[default]
+    Bytes,
+    Borsh,
+    Serde,
+}
+impl Parse for SolanaParamsEncoding {
+    fn parse(input: ParseStream) -> ParseResult<Self> {
+        let ident: syn::Ident = input.parse()?;
+
+        match ident.to_string().as_str() {
+            "Bytes" => Ok(SolanaParamsEncoding::Bytes),
+            "Borsh" => Ok(SolanaParamsEncoding::Borsh),
+            "Serde" => Ok(SolanaParamsEncoding::Serde),
+            _ => Err(syn::Error::new_spanned(
+                ident,
+                "Expected 'Bytes', `Borsh`, or `Serde`",
+            )),
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct SwitchboardSolanaFunctionArgs {
+    pub timeout_seconds: Option<syn::LitInt>,
+    pub encoding: Option<SolanaParamsEncoding>,
     pub commitment: Option<CommitmentConfig>,
     pub priority_fee: Option<u64>,
     pub compute_limit: Option<u32>,
-    pub address_lookup_table_accounts: Option<Vec<AddressLookupTableAccount>>
+    pub address_table_lookups: Option<Vec<AddressLookupTableAccount>>
 }
 /// An object containing the context to execute a Switchboard Function.
 /// Inititlizing this object will load all required variables from the runtime
@@ -56,13 +84,16 @@ pub struct FunctionRunner {
     pub verifier: Pubkey,
     /// The VerifierAccount's specified reward receiver.
     pub reward_receiver: Pubkey,
-
     // can be manually populated from client if missing
     /// The hex encoded FunctionAccountData, used to speed up RPC calls.
     pub function_data: Option<Box<FunctionAccountData>>,
     /// The pubkey of the VerifierAccount's enclave signer.
     pub verifier_enclave_signer: Option<Pubkey>,
     pub queue_authority: Option<Pubkey>,
+    pub commitment: Option<CommitmentConfig>,
+    pub priority_fee: Option<u64>,
+    pub compute_limit: Option<u32>,
+    pub address_table_lookups: Option<Vec<AddressLookupTableAccount>>,
 
     // only used for routines
     pub function_routine_key: Option<Pubkey>,
@@ -95,6 +126,19 @@ impl std::fmt::Display for FunctionRunner {
 }
 
 impl FunctionRunner {
+
+    pub fn set_commitment(&mut self, commitment: CommitmentConfig) {
+        self.commitment = Some(commitment);
+    }
+    pub fn set_priority_fee(&mut self, priority_fee: u64) {
+        self.priority_fee = Some(priority_fee);
+    }
+    pub fn set_compute_limit(&mut self, compute_limit: u32) {
+        self.compute_limit = Some(compute_limit);
+    }
+    pub fn set_address_table_lookups(&mut self, address_table_lookups: Vec<AddressLookupTableAccount>) {
+        self.address_table_lookups = Some(address_table_lookups);
+    }
     /// Create a new FunctionRunner instance with a provided RPC client.
     pub fn new_with_client(client: RpcClient) -> Result<Self, SbError> {
         let signer_keypair = generate_signer();
@@ -190,7 +234,6 @@ impl FunctionRunner {
             } else {
                 SolanaFunctionRequestType::Function(function.to_bytes().into())
             };
-
         Ok(Self {
             request_type,
             client: Arc::new(client),
@@ -210,6 +253,11 @@ impl FunctionRunner {
             attestation_queue,
             switchboard,
             switchboard_state,
+            commitment: None,
+            priority_fee: None,
+            compute_limit: None,
+            address_table_lookups: None,
+
         })
     }
 
@@ -459,21 +507,10 @@ impl FunctionRunner {
     /// and sign the transaction to send back on chain.
     pub async fn get_function_result(
         &self,
-        sb_function_result: SbFunctionResult, // (Vec<Instruction>,
-            // Option<CommitmentConfig>,
-            // Option<u64>,
-            // Option<u32>,
-            // Option<Vec<AddressLookupTableAccount>>)
+        mut ixs: Vec<Instruction>,
         error_code: u8,
     ) -> Result<FunctionResult, SbError> {
-        let SbFunctionResult {
-            mut ixs,
-            commitment,
-            priority_fee,
-            compute_limit,
-            address_lookup_table_accounts,
-        } = sb_function_result;
-        let priority_fee = priority_fee.unwrap_or(
+        let priority_fee = self.priority_fee.unwrap_or(
             self.calculate_recent_fee(ixs.
                 iter()
                 .map(|ix| ix.accounts.iter().map(|acc| 
@@ -497,14 +534,14 @@ impl FunctionRunner {
                 ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
             );
         }
-        
+        let compute_limit = self.compute_limit;
         if compute_limit.is_some() {
             ixs.insert(
                 0,
                 ComputeBudgetInstruction::set_compute_unit_limit(compute_limit.unwrap()),
             );
         }
-        let commitment = commitment.unwrap_or(CommitmentConfig::confirmed());
+        let commitment = self.commitment.unwrap_or(CommitmentConfig::confirmed());
         // Generate the SGX quote from the enclave
         // TODO: should we set a flag if this is a simulation?
         let quote_raw = Gramine::generate_quote(&self.signer.to_bytes()).unwrap_or_default();
@@ -515,23 +552,27 @@ impl FunctionRunner {
             let quote = Quote::parse(&quote_raw).unwrap();
             mr_enclave = quote.isv_report.mrenclave.try_into().unwrap();
         }
-
-        // Build serialized transaction
+        // Build serialized versioned transaction
         let verify_ixn: Instruction = self.build_verify_ixn(mr_enclave, error_code).await?;
         ixs.insert(1, verify_ixn);
         let blockhash = self.client.get_latest_blockhash_with_commitment(commitment)
-        .map_err(|e| SbError::CustomMessage(format!("failed to get blockhash: {}", e)))?;
+        .unwrap_or(
+            (self.client.get_latest_blockhash().unwrap(), self.client.get_slot().unwrap())
+        );
+        let empty_luts: Vec<AddressLookupTableAccount> = vec![];
         let message: solana_program::message::VersionedMessage = VersionedMessage::V0(v0::Message::try_compile(
             &self.payer,
             &ixs,
-            &address_lookup_table_accounts.unwrap_or_default(),
+            &self.address_table_lookups.as_ref().unwrap_or(
+                &empty_luts
+            ),
             blockhash.clone().0,
             ).map_err(|e| SbError::CustomMessage(format!("failed to compile message: {}", e)))?
         ).try_into()
         .map_err(|e| SbError::CustomMessage(format!("failed to create versioned message: {}", e)))?;
         
         let tx = solana_sdk::transaction::VersionedTransaction {
-            signatures: vec![self.signer_keypair.sign_message(bincode::serialize(&message).unwrap().as_slice())],
+            signatures: vec![self.signer_keypair.try_sign_message(bincode::serialize(&message).unwrap_or_default().as_slice()).map_err(|e| SbError::CustomMessage(format!("failed to sign message: {}", e)))?],
             message,
         };
 
@@ -581,11 +622,11 @@ impl FunctionRunner {
     /// Emits a serialized FunctionResult object to send to the quote verification
     /// sidecar.
 
-    pub async fn emit(&self, sb_function_result: SbFunctionResult) -> Result<(), SbError> {
-        
+    pub async fn emit(&self, ixs: Vec<Instruction>,
+    ) -> Result<(), SbError> {
         // we are just going to default to confired here. if people want to use anythign else they can call get_function_result and emit themselves
-                self.get_function_result(sb_function_result, 
-                    0)
+        
+        self.get_function_result(ixs, 0)
             .await
             .map_err(|e| SbError::CustomMessage(format!("failed to get verify ixn: {}", e)))
             .unwrap()
@@ -596,15 +637,7 @@ impl FunctionRunner {
 
     /// Emit an error and relay the error code on-chain for your downstream program to handle.
     pub async fn emit_error(&self, error_code: u8) -> Result<(), SbError> {
-        let sb_function_result: SbFunctionResult = 
-            SbFunctionResult {
-                ixs: vec![],
-                commitment: None,
-                priority_fee: None,
-                compute_limit: None,
-                address_lookup_table_accounts: None
-            };
-        self.get_function_result(sb_function_result, error_code)
+        self.get_function_result(vec![], error_code)
             .await
             .unwrap()
             .emit();

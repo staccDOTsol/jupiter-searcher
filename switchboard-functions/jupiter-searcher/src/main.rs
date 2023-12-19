@@ -1,12 +1,10 @@
 
-#[macro_use(c)]
-extern crate cute;
+
 use rand::{seq::SliceRandom, Rng};
-use switchboard_solana::{*, anchor_spl::{token_interface::spl_token_2022::onchain, token}};
+use switchboard_solana::{*, anchor_spl::{token_interface::spl_token_2022::onchain, token}, SwitchboardSolanaFunctionArgs};
 mod cli_args;
 use reqwest::header::HeaderMap;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::read_keypair_file, account::Account};
-use switchboard_solana::SbFunctionResult;
 use solana_program::address_lookup_table::{AddressLookupTableAccount};
 use solana_client::rpc_client::RpcClient;
 use solana_program::message::{VersionedMessage, v0};
@@ -16,8 +14,9 @@ use solana_sdk::{pubkey::Pubkey,
     transaction::{ VersionedTransaction}, compute_budget, signature::{Keypair}, signer::Signer,
 };
 
-use std::{sync::Arc, str::FromStr};
+use std::{sync::Arc, str::FromStr, borrow::{Borrow, BorrowMut}};
 use spl_associated_token_account::{get_associated_token_address_with_program_id};
+
 // create type of hashmap!{String => Instruction}
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -128,7 +127,7 @@ fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>) -> V
 }
 
 // from https://github.com/solana-labs/solana/blob/10d677a0927b2ca450b784f750477f05ff6afffe/sdk/program/src/message/versions/v0/mod.rs#L209
-async fn create_tx_with_address_table_lookup(
+fn create_tx_with_address_table_lookup(
     client: &RpcClient,
     instructions: &[Instruction],
     luts: &[AddressLookupTableAccount],
@@ -146,31 +145,28 @@ async fn create_tx_with_address_table_lookup(
         &[payer],
     ).unwrap()
 }
-
-
 #[switchboard_function]
-pub async fn my_function_logic(
-    runner: FunctionRunner,
-    params: Vec<u8>,
-) -> Result<SbFunctionResult, SbFunctionError> {
-
+    pub async fn my_function_logic(
+        runner: FunctionRunner,
+        params: Vec<u8>,
+    ) -> Result<Vec<Instruction>, SbFunctionError> {
         let rpc_client = runner.clone().client;
         let mut luts: Vec<String> = Vec::new();
 
     let mut ixs: Vec<Instruction> = Vec::new();
 
-    let future: Vec<String> = get_top_tokens().await;
+    let future: Vec<String> = get_top_tokens();
    
     let future = &future[0..40];
 
-         // take any two of the top 20
-        let slice = future.choose_multiple(&mut rand::thread_rng(), 2).cloned().collect::<Vec<String>>();
-        // make a threadpool of 40 of these
-        let random_number_1e9_to_1e12 = rand::thread_rng().gen_range(1e9..1e12);
-        let amount = random_number_1e9_to_1e12 as u64;
+        // take any two of the top 20
+    let slice = future.choose_multiple(&mut rand::thread_rng(), 2).cloned().collect::<Vec<String>>();
+    // make a threadpool of 40 of these
+    let random_number_1e9_to_1e12 = rand::thread_rng().gen_range(1e9..1e12);
+    let amount = random_number_1e9_to_1e12 as u64;
 // sleep random 1-10 seconds
-        let input = slice[0].clone();
-        let output = slice[1].clone();
+    let input = slice[0].clone();
+    let output = slice[1].clone();
     let url = "https://quote-api.jup.ag/v6/quote?inputMint="
     .to_owned()
     +&input+"&outputMint="
@@ -193,7 +189,7 @@ pub async fn my_function_logic(
         let token_program_output_mint = rpc_client.get_account(&output_mint).unwrap().owner;
         let mut market_addr = Pubkey::default();
         println!("Arb: {} {} {} {}", input_amount, reverse_output_amount, output, input);
-        let  configs = get_configs(None).await;
+        let  configs = get_configs(None);
         let mut market_addrs = Vec::new();
         let mut market_luts = Vec::new();
         let reserves_maybe = 
@@ -240,8 +236,8 @@ pub async fn my_function_logic(
                 
             }
                 let reqclient = reqwest::Client::new();
-            let request_body: reqwest::Body = reqwest::Body::from(serde_json::json!({
-                "quoteResponse": quote,
+                let request_body: reqwest::Body = reqwest::Body::from(serde_json::json!({
+                    "quoteResponse": quote,
                 "userPublicKey": pda.to_string(),
             }).to_string());
             let mut headers = HeaderMap::new();
@@ -428,11 +424,6 @@ pub async fn my_function_logic(
             ).unwrap());
 
                      
-    }
-            
-    } else {
-        println!("{} {} {}", output, input, reverse_output_amount);
-    }
     let recent_fees = calculate_recent_fee(ixs.
         iter()
         .map(|ix| ix.accounts.iter().map(|acc| 
@@ -447,19 +438,29 @@ pub async fn my_function_logic(
             .collect::<Vec<Pubkey>>())
         .flatten()
         .collect::<Vec<Pubkey>>().as_slice(),
-        &rpc_client).await;
+        &rpc_client);
         let luts = get_address_lookup_table_accounts(
             &rpc_client, luts.clone());
-    let sb_function_result: SbFunctionResult = SbFunctionResult {
-        ixs,
-        commitment: Some(CommitmentConfig::confirmed()),
-        priority_fee: Some(recent_fees as u64),
-        compute_limit: Some(1_400_000 as u32),
-        address_lookup_table_accounts: Some(luts)
-    };
-    Ok(sb_function_result)
+  
+
+runner.clone().borrow_mut().set_priority_fee((recent_fees));
+runner.clone().borrow_mut().set_address_table_lookups((luts.clone()));
+runner.clone().borrow_mut().set_commitment((CommitmentConfig::confirmed()));
+runner.clone().borrow_mut().set_compute_limit((1_400_000));
+
+ 
     }
-pub async fn calculate_recent_fee(
+            
+    } else {
+        println!("{} {} {}", output, input, reverse_output_amount);
+    }
+    
+
+
+    Ok(ixs)
+    }
+
+pub fn calculate_recent_fee(
     write_locked_accounts: &[Pubkey],
     rpc_client: &RpcClient
 ) -> u64 {
@@ -501,13 +502,14 @@ println!("write locked accounts that were resolved on this cluster: {:?}", write
     .sum::<u64>()
     .checked_div(recent_fees.len() as u64).unwrap_or(138)
 }
-async fn get_top_tokens() -> Vec<String> {
-    let url = "https://cache.jup.ag/top-tokens";
-    let top_tokens = serde_json::from_str::<Vec<String>>(&reqwest::get(url).await.unwrap().text().await.unwrap()).unwrap();
+fn get_top_tokens() -> Vec<String> {
+    let file = std::fs::read("./src/top_tokens.json").unwrap();
+    let string = String::from_utf8(file).unwrap();
+    let top_tokens: Vec<String> = serde_json::from_str(&string).unwrap();
     return top_tokens;
 }
 
-async fn get_configs(configs: Option<Vec<MarketConfigJson>>) -> Vec<MarketConfigJson> {
+fn get_configs(configs: Option<Vec<MarketConfigJson>>) -> Vec<MarketConfigJson> {
     if configs.is_some() {
         return configs.unwrap();
     }

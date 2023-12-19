@@ -737,12 +737,10 @@ name = "balancer-oracle-function"
 version = "0.1.0"
 dependencies = [
  "base64 0.21.5",
- "bs58 0.5.0",
+ "bs58 0.4.0",
  "clap 4.4.11",
- "cute",
  "jupiter-amm-interface",
  "jupiter_searcher",
- "maplit",
  "rand 0.8.5",
  "reqwest",
  "serde",
@@ -1538,12 +1536,6 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
-
-[[package]]
-name = "cute"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45e700c2d1c3feea9b695e79b2dfeeb93040556a58c556fae23f71b1e6b449fd"
 
 [[package]]
 name = "darling"
@@ -2867,12 +2859,6 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 dependencies = [
  "value-bag",
 ]
-
-[[package]]
-name = "maplit"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
 name = "memchr"
@@ -5831,6 +5817,7 @@ dependencies = [
  "superslice",
  "switchboard-common 0.11.1",
  "switchboard-solana-macros",
+ "syn 2.0.41",
  "tokio",
  "url",
 ]
@@ -5839,12 +5826,9 @@ dependencies = [
 name = "switchboard-solana-macros"
 version = "0.2.1"
 dependencies = [
- "bincode",
- "bs58 0.5.0",
  "dotenvy",
  "proc-macro2",
  "quote",
- "serde_json",
  "simple_logger",
  "solana-program",
  "solana-sdk",

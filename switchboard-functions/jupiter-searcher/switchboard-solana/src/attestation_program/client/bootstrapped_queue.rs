@@ -190,8 +190,7 @@ impl BootstrappedAttestationQueue {
         verifier: Pubkey,
         verifier_signer: Pubkey,
         params: Option<BootstrapAttestationQueueParams>,
-    ) -> Result<SbFunctionResult, SbError> {
-
+    ) -> Result<Vec<Instruction>, SbError> {
         let params = params.unwrap_or_default();
 
         let queue_authority = payer;
@@ -291,14 +290,8 @@ impl BootstrappedAttestationQueue {
             verifier_quote_rotate_ixn,
             verifier_heartbeat_ixn,
         ];
-        let sb_function_result: SbFunctionResult = SbFunctionResult {
-            ixs,
-            commitment: None,
-            priority_fee: None,
-            compute_limit: None,
-            address_lookup_table_accounts: None,
-        };
-        Ok(sb_function_result)
+
+        Ok(ixs)
     }
 
     pub fn create_tx(
@@ -359,7 +352,7 @@ impl BootstrappedAttestationQueue {
 
         let tx = Transaction::new(
             &keypairs,
-            Message::new(&ixs.ixs, Some(&payer.pubkey())),
+            Message::new(&ixs, Some(&payer.pubkey())),
             recent_blockhash,
         );
 
@@ -440,7 +433,7 @@ impl BootstrappedAttestationQueue {
             params,
         )?;
 
-        let message = Message::new(&ixs.ixs, Some(&payer.pubkey()));
+        let message = Message::new(&ixs, Some(&payer.pubkey()));
 
         let sig = client
             .send_and_confirm_message(&keypairs, message)
