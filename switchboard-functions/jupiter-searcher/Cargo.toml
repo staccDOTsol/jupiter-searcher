@@ -27,3 +27,5 @@ base64 = "0.21.5"
 jupiter-amm-interface = ">=0.2.1"
 jupiter_searcher = {path="../../programs/jupiter_searcher"}
 tokio = "1"
+futures = "0.3.29"
+shellexpand = "3.1.0"
