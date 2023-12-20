@@ -241,7 +241,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                 "quoteResponse": quote,
                 "userPublicKey": pda.to_string(),
                 "restrictIntermediateTokens": true,
-                "useSharedAccounts": true,
+                "useSharedAccounts": false,
                 "useTokenLedger": false,
                 "asLegacyTransaction": false,
                 "wrapAndUnwrapSol": false
@@ -307,7 +307,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                 "quoteResponse": reverse_quote,
                 "userPublicKey": pda.to_string(),
                 "restrictIntermediateTokens": true,
-                "useSharedAccounts": true,
+                "useSharedAccounts": false,
                 "useTokenLedger": false,
                 "asLegacyTransaction": false,
                 "wrapAndUnwrapSol": false
