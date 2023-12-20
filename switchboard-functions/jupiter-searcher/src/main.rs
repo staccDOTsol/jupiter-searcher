@@ -191,7 +191,7 @@ mut lutties: Vec<AddressLookupTableAccount>
        
 
         let mut ixs: Vec<Instruction> = Vec::new();
-    let url = "http://127.0.0.1:8080/quote?slippageBps=10000&asLegacyTransaction=true&inputMint="
+    let url = "http://127.0.0.1:8081/quote?slippageBps=10000&asLegacyTransaction=true&inputMint="
     .to_owned()
     +&input+"&outputMint="
     +&output+"&amount=" + &amount.to_string();
@@ -201,7 +201,7 @@ mut lutties: Vec<AddressLookupTableAccount>
     let output_amount: String = quote["outAmount"].to_string();
     let input_amount = input_amount[1..input_amount.len()-1].parse::<u64>().unwrap_or_default();
     let output_amount = (output_amount[1..output_amount.len()-1].parse::<u64>().unwrap_or_default());
-    let reverse_url = "http://127.0.0.1:8080/quote?asLegacyTransaction=true&slippageBps=10000&inputMint=".to_owned()+&output+"&outputMint="+&input+"&amount=" + output_amount.to_string().as_str();
+    let reverse_url = "http://127.0.0.1:8081/quote?asLegacyTransaction=true&slippageBps=10000&inputMint=".to_owned()+&output+"&outputMint="+&input+"&amount=" + output_amount.to_string().as_str();
     let reverse_quote=  (&reqwest::get(reverse_url.clone()).await.unwrap().text().await.unwrap());
     let reverse_quote = serde_json::from_str::<serde_json::Value>(&reverse_quote).unwrap();
     let reverse_output_amount:String = reverse_quote["outAmount"].to_string();
@@ -260,7 +260,7 @@ mut lutties: Vec<AddressLookupTableAccount>
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/json".parse().unwrap());
             headers.insert("Accept", "application/json".parse().unwrap());
-            let swap_transaction = reqclient.post("http://127.0.0.1:8080/swap-instructions")
+            let swap_transaction = reqclient.post("http://127.0.0.1:8081/swap-instructions")
             .body(request_body
             ).
             headers(headers
@@ -321,7 +321,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                 "useTokenLedger": false,
                 "asLegacyTransaction": true
             }).to_string());
-            let swap_transaction_reverse = serde_json::from_str::<SwapInstructions>(&reqclient.post("http://127.0.0.1:8080/swap-instructions")
+            let swap_transaction_reverse = serde_json::from_str::<SwapInstructions>(&reqclient.post("http://127.0.0.1:8081/swap-instructions")
             .body(request_body
             ).send().await.unwrap().text().await.unwrap()).unwrap();
 
