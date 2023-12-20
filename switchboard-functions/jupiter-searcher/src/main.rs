@@ -526,26 +526,43 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
         &mut lutties,
         payer_wallet,
     ).unwrap();
-    
-    let mut usized_lutties: Vec<_> = lutties.iter()
+    let mut seen_keys = HashSet::new();
+    let mut arglutties: Vec<_> = lutties.clone().iter()
         .map(|lut| {
-            let num_keys = needed_keys.iter()
-                .filter(|key| lut.addresses.contains(&Pubkey::from_str(key).unwrap()))
-                .count();
-            (lut.clone(), num_keys)
+            lutties.iter().map(
+                |lut2| {
+                    let lut2_count = needed_keys.iter().filter(|key| lut2.addresses.contains(&Pubkey::from_str(key).unwrap())).count();
+                    let lut1_count = needed_keys.iter().filter(|key| lut.addresses.contains(&Pubkey::from_str(key).unwrap())).count();
+                    if lut2_count > 0 && lut1_count > 0 && lut.key != lut2.key && !seen_keys.contains(&lut2.key) {
+                        seen_keys.insert(lut2.key);
+                        Some((lut2.clone(), lut2_count, lut1_count))
+                    }
+                    else {
+                        None
+                    }
+                }
+            ).collect::<Vec<Option<(AddressLookupTableAccount, usize, usize)>>>()
         })
-        .filter(|lut| lut.1 > 0)
+        .flatten()
+        .filter(|lut| lut.is_some())
+        .map(|lut| lut.unwrap())
+        .filter(|lut| lut.1 > 0 && lut.2 > 0)
         .collect();
+        arglutties.sort_by_key(|lut| lut.1);
+        arglutties.reverse();
+        let arglutties = arglutties.iter().map(|lut| lut.0.clone()).collect::<Vec<AddressLookupTableAccount>>();
+
+        println!("arglutties: {:?}", arglutties);
+        println!("lutties {:?}, needed_keys {:?}, missing_keys {:?}", arglutties.len(), needed_keys.len(), missing_keys.len());
+
+            let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
+                recent_fees );
+                ixs.insert(
+                    0, priority_fee_ix
+                );
+
+        
     
-    usized_lutties.sort_by_key(|a| std::cmp::Reverse(a.1));
-    
-    let usize_rounded_half = (usized_lutties.len() as f64 / 2.0).round() as usize;
-    usized_lutties.truncate(usize_rounded_half);
-    
-    let mut arglutties: Vec<_> = usized_lutties.into_iter().map(|lut| lut.0).collect();
-    arglutties.append(&mut new_lutties);
-    
-    println!("lutties {:?}, needed_keys {:?}, missing_keys {:?}", arglutties.len(), needed_keys.len(), missing_keys.len());
 
             let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
                 recent_fees );
@@ -555,7 +572,7 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
         let tx = create_tx_with_address_table_lookup(
                 rpc_client,
                 &ixs,
-                &arglutties,
+                arglutties.as_slice(),
                 payer_wallet);
                 println!("attempting {} <-> {} swap", input, output);
                 let signature = rpc_client
@@ -853,15 +870,13 @@ async fn main() {
                 let quote = QuoteResponse::try_from_response(reqwest::get(url.clone()).await.unwrap()).await.unwrap_or_default();
 
                 let value = quote.out_amount as u128 * balance_ata as u128;
-                println!("reserve token mint{}: value: {}", reserve.liquidity_token.mint, value);
                 if value > 10_000 {
+                    println!("reserve: {} token mint {}: value: {}", reserve.address, reserve.liquidity_token.mint, value);
                 input_mints.push(reserve.liquidity_token.mint.clone());
 
                 let value = quote.out_amount as f64;
-                if value != 0.0 {
                     values.insert(reserve.address.clone(), (value, reserve.liquidity_token.mint.clone()));
                     println!("$1.00 of {}: {}", reserve.liquidity_token.mint.clone(), value);
-                }
             }
         }
 
