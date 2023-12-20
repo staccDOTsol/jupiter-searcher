@@ -737,9 +737,9 @@ fn get_configs() -> Vec<MarketConfigJson> {
     let configs: Vec<MarketConfigJson> = serde_json::from_str(&string).unwrap();
     return configs;
 }
-const MAX_THREADS: usize = 20;
+const MAX_THREADS: usize = 124;
 
-#[tokio::main(worker_threads = 20)]
+#[tokio::main(worker_threads = 124)]
 async fn main() {
 
     let file = std::fs::read("./src/luts.json").unwrap();
