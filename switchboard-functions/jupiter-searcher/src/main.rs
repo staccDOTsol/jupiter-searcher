@@ -3,10 +3,10 @@ mod cli_args;
 use clap::Parser;
 use cli_args::CliArgs;
 use reqwest::header::HeaderMap;
-use solana_program::program_pack::Pack;
+
 use solana_program::address_lookup_table::{AddressLookupTableAccount};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use switchboard_solana::{Transaction};
+
 use std::collections::{HashMap, HashSet};
 use std::{str::FromStr};
 use rand::{seq::SliceRandom};
@@ -112,7 +112,7 @@ fn deserialize_instruction (instruction: HashedIx) -> Instruction {
     };
     instruction
 }
-fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>) -> Vec<AddressLookupTableAccount> {
+fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>, payer: Pubkey) -> Vec<AddressLookupTableAccount> {
     let keys = &keys.iter().
     map(|key| {
         Pubkey::from_str(key).unwrap()
@@ -124,24 +124,27 @@ fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>) -> V
     let  chunks= keys.chunks(100);
     
     for chunk in chunks {
-            let raw_accounts = client.get_multiple_accounts(&chunk).unwrap();
+            let raw_accounts = client.get_multiple_accounts(chunk).unwrap();
 
             for i in 0..raw_accounts.len() {
                 if raw_accounts[i].is_some() {
                     let raw_account = raw_accounts[i].as_ref().unwrap();
                     let address_lookup_table = solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&raw_account.data).unwrap();
-                    let address_lookup_table_account = AddressLookupTableAccount {
-                        key: chunk[i],
-                        addresses: address_lookup_table.addresses.to_vec(),
-                    };
-                    luts.push(address_lookup_table_account);
+                    if address_lookup_table.meta.authority.unwrap() == payer {
+                        let address_lookup_table_account = AddressLookupTableAccount {
+                            key: chunk[i],
+                            addresses: address_lookup_table.addresses.to_vec(),
+                        };
+                        luts.push(address_lookup_table_account);
+                    }
+                    
                 }
             }
         }
     
     luts 
 }
-const USDC: &str = ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 // from https://github.com/solana-labs/solana/blob/10d677a0927b2ca450b784f750477f05ff6afffe/sdk/program/src/message/versions/v0/mod.rs#L1269
 fn create_tx_with_address_table_lookup(
     client: &RpcClient,
@@ -155,7 +158,7 @@ fn create_tx_with_address_table_lookup(
         VersionedMessage::V0(v0::Message::try_compile(
             &payer.pubkey(),
             instructions,
-            &luts,
+            luts,
             blockhash,
         ).unwrap()),
         &[payer],
@@ -170,19 +173,8 @@ mut lutties: Vec<AddressLookupTableAccount>
 
 )  {
         let input_mint = Pubkey::from_str(&input).unwrap();
-        let output_mint = Pubkey::from_str(&output).unwrap();
+        let _output_mint = Pubkey::from_str(&output).unwrap();
         let pda = payer_wallet.pubkey();
-        let decimals_input = configs.
-        into_iter()
-        .map(|config| {
-            for reserve in config.reserves.clone().into_iter() {
-                if reserve.liquidity_token.mint == input {
-                    return reserve.liquidity_token.decimals as u32;
-                }
-            }
-            0 as u32
-        })
-        .collect::<Vec<u32>>()[0];
     
         
 
@@ -192,42 +184,28 @@ mut lutties: Vec<AddressLookupTableAccount>
 
         let mut ixs: Vec<Instruction> = Vec::new();
 
-        // get an initial quote of 1 usdc to input
-
-        let url = "http://127.0.0.1:8080/quote?slippageBps=10000&asLegacyTransaction=true&inputMint="
-        .to_owned()
-        +&USDC.to_string()+"&outputMint="
-        +&input+"&amount=1000000";
-    
-        let quote= (&reqwest::get(url.clone()).await.unwrap().text().await.unwrap());
-        let quote = serde_json::from_str::<serde_json::Value>(&quote).unwrap();
-        let output_amount: String = quote["outAmount"].to_string();
-        let output_amount = ((output_amount[1..output_amount.len()-1].parse::<u64>().unwrap_or_default()) ) as f64;
-        let value = output_amount as f64;
-        let amount = (amount as f64 * value) as u64;
-    let url = "http://127.0.0.1:8080/quote?slippageBps=10000&swapMode=ExactOut&asLegacyTransaction=true&inputMint="
+    let url = "http://127.0.0.1:8080/quote?inputMint="
     .to_owned()
     +&input+"&outputMint="
-    +&output+"&amount=" + &amount.to_string();
+    +&output+"&amount="+amount.to_string().as_str() +  "&slippageBps=10000&swapMode=ExactOut&asLegacyTransaction=false";
 
-    let quote= (&reqwest::get(url.clone()).await.unwrap().text().await.unwrap());
-    let quote = serde_json::from_str::<serde_json::Value>(&quote).unwrap();
+    let quote= &reqwest::get(url.clone()).await.unwrap().text().await.unwrap();
+    let quote = serde_json::from_str::<serde_json::Value>(quote).unwrap();
     let input_amount = quote["inAmount"].to_string();
     let output_amount: String = quote["outAmount"].to_string();
     let input_amount = input_amount[1..input_amount.len()-1].parse::<u64>().unwrap_or_default();
     let output_amount = ((output_amount[1..output_amount.len()-1].parse::<u64>().unwrap_or_default())) as u64;
-    let reverse_url = "http://127.0.0.1:8080/quote?asLegacyTransaction=false&slippageBps=10000&inputMint=".to_owned()+&output+"&outputMint="+&input+"&amount=" + output_amount.to_string().as_str();
-    let reverse_quote=  (&reqwest::get(reverse_url.clone()).await.unwrap().text().await.unwrap());
-    let reverse_quote = serde_json::from_str::<serde_json::Value>(&reverse_quote).unwrap();
+    let reverse_url =  "http://127.0.0.1:8080/quote?inputMint="
+    .to_owned()
+    +&output+"&outputMint="
+    +&input+"&amount="+output_amount.to_string().as_str() +  "&slippageBps=10000&swapMode=ExactIn&asLegacyTransaction=false";
+    let reverse_quote=  &reqwest::get(reverse_url.clone()).await.unwrap().text().await.unwrap();
+    let reverse_quote = serde_json::from_str::<serde_json::Value>(reverse_quote).unwrap();
     let reverse_output_amount:String = reverse_quote["outAmount"].to_string();
     let reverse_output_amount = reverse_output_amount[1..reverse_output_amount.len()-1].parse::<u64>().unwrap_or_default();
-    if reverse_output_amount as f64 > input_amount as f64 * (1.0008* 0.999) {
-        let token_program_input_mint = triton.get_account(&input_mint).unwrap().owner;
-        
-
-        let ata = get_associated_token_address_with_program_id(&pda, &input_mint, &token_program_input_mint);
+    if reverse_output_amount as f64 > input_amount as f64 * (1.0002) {
         let mut market_addr = Pubkey::default();
-        println!("Arb: {} {} {} {}", input_amount, reverse_output_amount, output, input);
+        //println!("Arb: {} {} {} {}", input_amount, reverse_output_amount, output, input);
         let mut market_addrs = HashMap::new();
         let mut reserves_maybe = 
         configs.iter()
@@ -235,7 +213,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                 for reserve in config.reserves.iter() {
                     if reserve.liquidity_token.mint == input {
                         market_addr = Pubkey::from_str(&config.address).unwrap();
-                        market_addrs.insert(reserve.clone().address, (config.lookup_table_address.clone(), market_addr.clone()));
+                        market_addrs.insert(reserve.clone().address, (config.lookup_table_address.clone(), market_addr));
                         return Some(reserve.clone());
                     }
                 }
@@ -255,7 +233,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                 done = true;
             }
             let reserve = reserve.unwrap();
-            market_addr = market_addrs[reserve.address.as_str()].1.clone();
+            market_addr = market_addrs[reserve.address.as_str()].1;
 
             //let out_ata = get_associated_token_address_with_program_id(&pda, &output_mint, &token_program_output_mint);
                 let reqclient = reqwest::Client::new();
@@ -265,7 +243,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                 "restrictIntermediateTokens": true,
                 "useSharedAccounts": true,
                 "useTokenLedger": false,
-                "asLegacyTransaction": true,
+                "asLegacyTransaction": false,
                 "wrapAndUnwrapSol": false
             }).to_string());
             let mut headers = HeaderMap::new();
@@ -279,7 +257,7 @@ mut lutties: Vec<AddressLookupTableAccount>
 
             send().await.unwrap().text().await.unwrap();
             // replace instances of / with nothing
-            let swap_transaction = swap_transaction.replace("\\", "");
+            let swap_transaction = swap_transaction.replace('\\', "");
             let swap_transaction = serde_json::from_str::<SwapInstructions>(&swap_transaction).unwrap();
             
             let maybe_setup_ixs: Vec<Instruction>;
@@ -292,12 +270,13 @@ mut lutties: Vec<AddressLookupTableAccount>
                  maybe_setup_ixs = vec![];
             }
             
-        if maybe_setup_ixs.len() > 0 {
+        if !maybe_setup_ixs.is_empty() {
             let tx = create_tx_with_address_table_lookup(
-                &rpc_client,
+                rpc_client,
                 &maybe_setup_ixs,
                 &[],
-                &payer_wallet);            
+                payer_wallet);            
+                //println!("attempting xtra setup ix (whynot)");
                 let signature = rpc_client
                     .send_transaction(
                         &tx,/*
@@ -307,11 +286,11 @@ mut lutties: Vec<AddressLookupTableAccount>
                         }, */
                     )
                     ;
-                    if !signature.is_err() {
-                        //println!("winner winner chickum dinner: {:?}", signature.unwrap());
+                    if signature.is_ok() {
+                        ////println!("winner winner chickum dinner: {:?}", signature.unwrap());
                     }
                     else {
-                        println!("error: {:?}", signature.err().unwrap());
+                        //println!("error: {:?}", signature.err().unwrap());
                     }
         }/*
 
@@ -330,7 +309,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                 "restrictIntermediateTokens": true,
                 "useSharedAccounts": true,
                 "useTokenLedger": false,
-                "asLegacyTransaction": true,
+                "asLegacyTransaction": false,
                 "wrapAndUnwrapSol": false
             }).to_string());
             let swap_transaction_reverse = serde_json::from_str::<SwapInstructions>(&reqclient.post("http://127.0.0.1:8080/swap-instructions")
@@ -339,8 +318,10 @@ mut lutties: Vec<AddressLookupTableAccount>
 
 
             
-        println!("ata {:?}", ata);
+        let token_program_input_mint = triton.get_account(&input_mint).unwrap().owner;
+        
 
+        let ata = get_associated_token_address_with_program_id(&pda, &input_mint, &token_program_input_mint);
     ixs.push(solend_sdk::instruction::flash_borrow_reserve_liquidity(
         solend_sdk::solend_mainnet::ID,
         input_amount,
@@ -349,7 +330,7 @@ mut lutties: Vec<AddressLookupTableAccount>
         Pubkey::from_str(&reserve.address).unwrap(),
         market_addr
     ));
-        for ix in vec![deserialize_instruction(swap_transaction.swap_instruction.clone()),
+        for ix in [deserialize_instruction(swap_transaction.swap_instruction.clone()),
         deserialize_instruction(swap_transaction_reverse.swap_instruction.clone())] {
 
 
@@ -392,7 +373,7 @@ mut lutties: Vec<AddressLookupTableAccount>
         pda
     ));
     let balance_ata = u64::from_str(&rpc_client.get_token_account_balance(&ata).unwrap().amount).unwrap();
-    println!("balance ata: {:?}", balance_ata);
+    //println!("balance ata: {:?}", balance_ata);
             ixs.push(spl_token::instruction::transfer(
                 &spl_token::id(),
                 &ata,
@@ -406,7 +387,7 @@ mut lutties: Vec<AddressLookupTableAccount>
                      
     let recent_fees = calculate_recent_fee(ixs.
         iter()
-        .map(|ix| ix.accounts.iter().map(|acc| 
+        .flat_map(|ix| ix.accounts.iter().map(|acc| 
             if acc.is_writable { acc.pubkey } else { Pubkey::default() })
             .collect::<Vec<Pubkey>>()
             .iter()
@@ -416,127 +397,126 @@ mut lutties: Vec<AddressLookupTableAccount>
             .filter(|pubkey| **pubkey != Pubkey::default())
             .cloned()
             .collect::<Vec<Pubkey>>())
-        .flatten()
         .collect::<Vec<Pubkey>>().as_slice(),
-        &triton);
-        println!("recent fees: {:?}", recent_fees);
+        triton);
+        //println!("recent fees: {:?}", recent_fees);
 
             let mut  needed_keys = ixs.
             iter()
-            .map(|ix| ix.accounts.iter().map(|acc| 
+            .flat_map(|ix| ix.accounts.iter().map(|acc| 
                 acc.pubkey.to_string()
                 )
                 .collect::<Vec<String>>())
-            .flatten()
             .collect::<Vec<String>>();
+        let mut missing_keys = Vec::new();
 
-            // find the top 4 luts with the most needed keys
-            let mut usized_lutties = lutties.
-            iter()
-            .map(|lut| {
-                let mut num_keys = 0;
-                for key in &needed_keys {
-                    if lut.addresses.contains(&Pubkey::from_str(key).unwrap()) {
-                        num_keys += 1;
-                    }
-                }
-                (lut.clone(), num_keys)
-            })
-            .collect::<Vec<(AddressLookupTableAccount, usize)>>();
-        usized_lutties.sort_by(|a, b| a.1.cmp(&b.1));
-        usized_lutties.reverse();
-        usized_lutties.truncate(6);
-        lutties = usized_lutties.iter().map(|lut| lut.0.clone()).collect::<Vec<AddressLookupTableAccount>>();
-        // find needed_keys that are missing from lutties
+                
+        if market_addrs[reserve.address.as_str()].0.is_some() {
+            let lookuptable = market_addrs[reserve.address.as_str()].0.clone().unwrap();
+            let lookuptable = Pubkey::from_str(&lookuptable).unwrap();
+            let account = rpc_client.get_account(&lookuptable).unwrap();
+            let account = AddressLookupTable::deserialize(&account.data).unwrap();
+            let lookup_table_address_account = AddressLookupTableAccount {
+                key: lookuptable,
+                addresses: account.addresses.to_vec(),
+            };
+            lutties.push(lookup_table_address_account);
+        }
+        
+        if !swap_transaction.address_lookup_table_addresses.is_empty() {
+            //println!("swap transaction address lookup table addresses: {:?}", swap_transaction.address_lookup_table_addresses.len());
+            for lut in swap_transaction.address_lookup_table_addresses.clone() {
+                let lut = Pubkey::from_str(&lut).unwrap();
+                let account = rpc_client.get_account(&lut).unwrap();
+                let account = AddressLookupTable::deserialize(&account.data).unwrap();
+                let lookup_table_address_account = AddressLookupTableAccount {
+                    key: lut,
+                    addresses: account.addresses.to_vec(),
+                };
+                lutties.push(lookup_table_address_account);
+            }
+        }
+        if !swap_transaction_reverse.address_lookup_table_addresses.is_empty() {
+            //println!("reverse swap transaction address lookup table addresses: {:?}", swap_transaction_reverse.address_lookup_table_addresses.len());
+            for lut in swap_transaction_reverse.address_lookup_table_addresses.clone() {
+                let lut = Pubkey::from_str(&lut).unwrap();
+                let account = rpc_client.get_account(&lut).unwrap();
+                let account = AddressLookupTable::deserialize(&account.data).unwrap();
+                let lookup_table_address_account = AddressLookupTableAccount {
+                    key: lut,
+                    addresses: account.addresses.to_vec(),
+                };
+                lutties.push(lookup_table_address_account);
+            }
+        }
         let mut lutties_public_keys = lutties.
         iter()
-        .map(|lut| {
+        .flat_map(|lut| {
             lut.addresses.clone()
         })
-        .flatten()
         .collect::<Vec<Pubkey>>();
 
         lutties_public_keys.sort();
         lutties_public_keys.dedup();
         needed_keys.sort();
         needed_keys.dedup();
-        let mut missing_keys = Vec::new();
-        for key in needed_keys {
+        for key in needed_keys.clone() {
             if !lutties_public_keys.contains(&Pubkey::from_str(&key).unwrap()) {
                 missing_keys.push(key);
             }
         }
-        println!("missing keys: {:?}", missing_keys.len());
+        //println!("missing keys: {:?}", missing_keys.len());
         let mut new_lutties = create_and_or_extend_luts(
             &missing_keys.iter().map(|key| Pubkey::from_str(key).unwrap()).collect::<Vec<Pubkey>>(),
-            &rpc_client,
+            rpc_client,
             &mut lutties,
-            &payer_wallet,
+            payer_wallet,
         ).unwrap();
+            // find the top 4 luts with the most needed keys
+            let mut usized_lutties = lutties.
+            iter()
+            .map(|lut| {
+                let mut num_keys = 0;
+                for key in &needed_keys.clone() {
+                    if lut.addresses.contains(&Pubkey::from_str(key).unwrap()) {
+                        num_keys += 1;
+                    }
+                }
+                (lut.clone(), num_keys)
+            })
+            .collect::<Vec<(AddressLookupTableAccount, usize)>>()
+            .iter().filter(|&lut| lut.1 > 0).cloned()
+            .collect::<Vec<(AddressLookupTableAccount, usize)>>();
+        usized_lutties.sort_by(|a, b| a.1.cmp(&b.1));
+        usized_lutties.reverse();
+        lutties = usized_lutties.iter().map(|lut| lut.0.clone()).collect::<Vec<AddressLookupTableAccount>>();
         lutties.append(&mut new_lutties);
-        println!("lutties: {:?}", lutties.len());
+        println!("lutties {:?}, needed_keys {:?}, missing_keys {:?}", lutties.len(), needed_keys.len(), missing_keys.len());
+        // find needed_keys that are missing from lutties
+        
 
-
-                
-            if market_addrs[reserve.address.as_str()].0.is_some() {
-                let lookuptable = market_addrs[reserve.address.as_str()].0.clone().unwrap();
-                let lookuptable = Pubkey::from_str(&lookuptable).unwrap();
-                let account = rpc_client.get_account(&lookuptable).unwrap();
-                let account = AddressLookupTable::deserialize(&account.data).unwrap();
-                let lookup_table_address_account = AddressLookupTableAccount {
-                    key: lookuptable,
-                    addresses: account.addresses.to_vec(),
-                };
-                lutties.push(lookup_table_address_account);
-            }
-            
-            if swap_transaction.address_lookup_table_addresses.len() > 0 {
-                println!("swap transaction address lookup table addresses: {:?}", swap_transaction.address_lookup_table_addresses.len());
-                for lut in swap_transaction.address_lookup_table_addresses.clone() {
-                    let lut = Pubkey::from_str(&lut).unwrap();
-                    let account = rpc_client.get_account(&lut).unwrap();
-                    let account = AddressLookupTable::deserialize(&account.data).unwrap();
-                    let lookup_table_address_account = AddressLookupTableAccount {
-                        key: lut,
-                        addresses: account.addresses.to_vec(),
-                    };
-                    lutties.push(lookup_table_address_account);
-                }
-            }
-            if swap_transaction_reverse.address_lookup_table_addresses.len() > 0 {
-                println!("reverse swap transaction address lookup table addresses: {:?}", swap_transaction_reverse.address_lookup_table_addresses.len());
-                for lut in swap_transaction_reverse.address_lookup_table_addresses.clone() {
-                    let lut = Pubkey::from_str(&lut).unwrap();
-                    let account = rpc_client.get_account(&lut).unwrap();
-                    let account = AddressLookupTable::deserialize(&account.data).unwrap();
-                    let lookup_table_address_account = AddressLookupTableAccount {
-                        key: lut,
-                        addresses: account.addresses.to_vec(),
-                    };
-                    lutties.push(lookup_table_address_account);
-                }
-            }
             let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
                 recent_fees );
                 ixs.insert(
                     0, priority_fee_ix
                 );
         let tx = create_tx_with_address_table_lookup(
-                &rpc_client,
+                rpc_client,
                 &ixs,
                 &lutties,
-                &payer_wallet);
-                
+                payer_wallet);
+                println!("attempting {} <-> {} swap", input, output);
                 let signature = rpc_client
                     .send_transaction_with_config(
                         &tx,
                         solana_client::rpc_config::RpcSendTransactionConfig {
-                            skip_preflight: true,
+                            skip_preflight: false,
                             ..solana_client::rpc_config::RpcSendTransactionConfig::default()
                         }, 
                     )
                     ;
-                    if !signature.is_err() {
+                    if signature.is_ok() {
+                        println!("https://solscan.io/tx/{}", signature.unwrap());
                     }
                     else {
                         println!("error: {:?}", signature.err().unwrap());
@@ -549,14 +529,14 @@ mut lutties: Vec<AddressLookupTableAccount>
 pub fn make_moar_luts(
     lutties: &mut Vec<AddressLookupTableAccount>,
     public_keys: Vec<String>,
-    triton: &RpcClient,
+    _triton: &RpcClient,
     rpc_client: &RpcClient,
-    payer: &Keypair,
+    _payer: &Keypair,
 ) -> Result<Vec<AddressLookupTableAccount>, Box<dyn std::error::Error>> {
     let unique_public_keys = deduplicate_public_keys(&public_keys);
-    let mut luts = fetch_existing_luts(lutties, rpc_client, &unique_public_keys)?;
+    let luts = fetch_existing_luts(lutties, rpc_client, &unique_public_keys)?;
     let luts_public_keys = get_public_keys_from_luts(&luts);
-    let remaining_public_keys = get_remaining_public_keys(&unique_public_keys, &luts_public_keys);
+    let _remaining_public_keys = get_remaining_public_keys(&unique_public_keys, &luts_public_keys);
     let used_luts = luts;
     save_luts_to_file(&used_luts.
         iter()
@@ -576,7 +556,7 @@ fn deduplicate_public_keys(public_keys: &Vec<String>) -> Vec<Pubkey> {
 
 fn fetch_existing_luts(
     lutties: &Vec<AddressLookupTableAccount>,
-    rpc_client: &RpcClient,
+    _rpc_client: &RpcClient,
     needed_keys: &Vec<Pubkey>,
 ) -> Result<Vec<AddressLookupTableAccount>, Box<dyn std::error::Error>> {
    
@@ -610,8 +590,7 @@ fn fetch_existing_luts(
             }
         }
     }
-    sorted_luts.truncate(6);
-    println!("sorted luts: {:?}", sorted_luts.len());
+    //println!("sorted luts: {:?}", sorted_luts.len());
     Ok(sorted_luts)
 
 }
@@ -644,36 +623,36 @@ unique_public_keys
 fn create_and_or_extend_luts(
     remaining_public_keys: &Vec<Pubkey>,
     rpc_client: &RpcClient,
-    mut luts: &mut Vec<AddressLookupTableAccount>,
+    luts: &mut Vec<AddressLookupTableAccount>,
     payer: &Keypair,
 ) -> Result<Vec<AddressLookupTableAccount>, Box<dyn std::error::Error>> {
     let mut used_luts = Vec::new();
 
     for pubkeys in remaining_public_keys.chunks(25) {
-        let (mut lut, index) = find_or_create_lut(&rpc_client, &payer, &mut luts)?;
-        let latest_blockhash = rpc_client.get_latest_blockhash().unwrap(); 
+        let (lut, _index) = find_or_create_lut(rpc_client, payer, luts, remaining_public_keys.len())?;
             let extend_ix = solana_program::address_lookup_table::instruction::extend_lookup_table(
                 lut.key,
                 payer.pubkey(),
                 Some(payer.pubkey()),
                 pubkeys.to_vec(),
             );
-    
+            let latest_blockhash = rpc_client.get_latest_blockhash().unwrap(); 
+            //println!("extending lut: {:?}", lut.key);
             rpc_client
-                .send_transaction(&Transaction::new_signed_with_payer(
-                    &[extend_ix],
-                    Some(&payer.pubkey()),
-                    &[&payer],
-                    latest_blockhash,
-                ))
-                .unwrap();
+                .send_transaction(&VersionedTransaction::try_new(
+                        VersionedMessage::V0(v0::Message::try_compile(
+                            &payer.pubkey(),
+                            &[extend_ix],
+                            &[],
+                            latest_blockhash,
+                        ).unwrap()),
+                        &[payer],
+                    ).unwrap()
+                ).unwrap();
+
+                    
             used_luts.push(lut);
         }
-    // write used_luts to src/luts.json 
-    save_luts_to_file(&used_luts.
-        iter()
-        .map(|lut| lut.key.to_string())
-        .collect::<Vec<String>>()).unwrap();
 
     Ok(used_luts)
 }
@@ -681,16 +660,18 @@ fn find_or_create_lut(
     rpc_client:  &RpcClient,
     payer: &Keypair,
     luts: &mut Vec<AddressLookupTableAccount>,
+    howmany: usize
 ) -> Result<(AddressLookupTableAccount, usize), Box<dyn std::error::Error>> {
+    luts.shuffle(&mut rand::thread_rng());
     for (index, lut) in luts.iter().enumerate() {
         let acc = rpc_client.get_account(&lut.key).unwrap();
         let address_lookup_table = solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&acc.data).unwrap();
-        println!("{}, {}", lut.addresses.len(), address_lookup_table.meta.authority.unwrap() == payer.pubkey());
-        if lut.addresses.len() < 255-25 && address_lookup_table.meta.authority.unwrap() == payer.pubkey() {
+        //println!("{}, {}", lut.addresses.len(), address_lookup_table.meta.authority.unwrap() == payer.pubkey());
+        if lut.addresses.len() < (255_usize -howmany) && address_lookup_table.meta.authority.unwrap() == payer.pubkey() {
             return Ok((lut.clone(), index));
         }
     }
-    return Ok((create_new_lut(&rpc_client, &payer).unwrap(), luts.len()))
+    Ok((create_new_lut(rpc_client, payer).unwrap(), luts.len()))
 }
 use solana_sdk::address_lookup_table::state::AddressLookupTable;
 
@@ -700,7 +681,7 @@ fn create_new_lut(
 ) -> Result<AddressLookupTableAccount, Box<dyn std::error::Error>> {
     // Create a new AddressLookupTable
     let recent_slot = rpc_client
-    .get_slot_with_commitment(CommitmentConfig::confirmed())
+    .get_slot_with_commitment(CommitmentConfig::processed())
     .unwrap()//"237009123 is not a recent slot"
     - 50;
     let (create_ix, table_pk) =
@@ -709,39 +690,68 @@ fn create_new_lut(
             payer.pubkey(),
             recent_slot,
         );
-    let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();  
-    let mut transaction = Transaction::new_with_payer(&[create_ix], Some(&payer.pubkey()));
-    transaction.sign(&[payer], recent_blockhash);
-    rpc_client.send_and_confirm_transaction(&transaction)?;
+    let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();  
+    
+    //println!("creating lut: {:?}", table_pk);
+    rpc_client
+    .send_and_confirm_transaction_with_spinner(&VersionedTransaction::try_new(
+            VersionedMessage::V0(v0::Message::try_compile(
+                &payer.pubkey(),
+                &[create_ix],
+                &[],
+                latest_blockhash,
+            ).unwrap()),
+            &[payer],
+        ).unwrap()
+    ).unwrap();
 
     let lut = AddressLookupTableAccount {
         key: table_pk,
         addresses: vec![],
     };
 
+
+    let file = std::fs::read("./src/luts.json").unwrap();
+    let string = String::from_utf8(file).unwrap();
+        let mut lutties: Vec<String> = serde_json::from_str(&string).unwrap();
+        ////println !("lutties: {:?}", lutties.len());
+// dedupe
+        lutties.sort();
+        lutties.dedup();
+        ////println !("lutties: {:?}", lutties.len());
+    // write new lut to lutties to file
+    lutties.push(lut.key.to_string());
+    ////println !("lutties+1: {:?}", lutties.len());
+    save_luts_to_file(&lutties).unwrap();
+    
     Ok(lut)
 
 }
 use std::fs;
 
 fn save_luts_to_file(lutties: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let data = lutties.join("\n");
-    fs::write("./src/luts.txt", data)?;
+    // write to lut.json 
+    let mut lutties = lutties.clone();
+    lutties.sort();
+    lutties.dedup();
+    let lutties = serde_json::to_string(&lutties).unwrap();
+    fs::write("./src/luts.json", lutties).unwrap();
+
     Ok(())
 }
 pub fn calculate_recent_fee(
     write_locked_accounts: &[Pubkey],
     rpc_client: &RpcClient
 ) -> u64 {
-    println!("calculating recent fee");
-    println!("write locked accounts: {:?}", write_locked_accounts.len());
+    //println!("calculating recent fee");
+    //println!("write locked accounts: {:?}", write_locked_accounts.len());
     // do in chunks of 100 
-    let mut write_locked_accounts = write_locked_accounts.to_vec();
-    let mut chunks = write_locked_accounts.chunks(100);
+    let write_locked_accounts = write_locked_accounts.to_vec();
+    let chunks = write_locked_accounts.chunks(100);
     for chunk in chunks {
             let account_infos = rpc_client.get_multiple_accounts_with_commitment(
-                &chunk,
-                CommitmentConfig::confirmed()
+                chunk,
+                CommitmentConfig::processed()
             ).unwrap().value;
             let mut index = 0;
             let write_locked_accounts = &account_infos
@@ -763,7 +773,7 @@ pub fn calculate_recent_fee(
             .filter(|pubkey| **pubkey != Pubkey::default())
             .cloned()
             .collect::<Vec<Pubkey>>();
-            println!("write locked accounts that were resolved on this cluster: {:?}", write_locked_accounts.len());
+            //println!("write locked accounts that were resolved on this cluster: {:?}", write_locked_accounts.len());
             let recent_fees = rpc_client.get_recent_prioritization_fees(
                 write_locked_accounts
             ).unwrap_or_default();
@@ -784,8 +794,8 @@ pub fn calculate_recent_fee(
 }
 async fn get_top_tokens() -> Vec<String> {
     let url = "https://cache.jup.ag/top-tokens";
-    let top_tokens = serde_json::from_str::<Vec<String>>(&reqwest::get(url).await.unwrap().text().await.unwrap()).unwrap();
-    return top_tokens;
+    
+    serde_json::from_str::<Vec<String>>(&reqwest::get(url).await.unwrap().text().await.unwrap()).unwrap()
 }
 
 fn get_configs() -> Vec<MarketConfigJson> {
@@ -793,7 +803,7 @@ fn get_configs() -> Vec<MarketConfigJson> {
     let file = std::fs::read("./src/configs.json").unwrap();
     let string = String::from_utf8(file).unwrap();
     let configs: Vec<MarketConfigJson> = serde_json::from_str(&string).unwrap();
-    return configs;
+    configs
 }
 const MAX_THREADS: usize = 126;
 
@@ -803,18 +813,18 @@ async fn main() {
     let file = std::fs::read("./src/luts.json").unwrap();
     let string = String::from_utf8(file).unwrap();
         let mut lutties: Vec<String> = serde_json::from_str(&string).unwrap();
-        println !("lutties: {:?}", lutties.len());
+        ////println !("lutties: {:?}", lutties.len());
 // dedupe
         lutties.sort();
         lutties.dedup();
-        println !("lutties: {:?}", lutties.len());
+        ////println !("lutties: {:?}", lutties.len());
     let args = CliArgs::parse();
 
     let configs = get_configs();
     
-    let client = Arc::new(RpcClient::new(&args.url));
+    let client = Arc::new(RpcClient::new_with_commitment(&args.url, CommitmentConfig::processed()));
     let triton = Arc::new(
-        RpcClient::new("https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718"));
+        RpcClient::new_with_commitment("https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718", CommitmentConfig::processed()));
 
         let mut luts = Vec::new();
         let mut lutties = lutties. 
@@ -824,18 +834,17 @@ async fn main() {
         lutties.sort();
         lutties.reverse();
         let lutties = lutties.clone();
-        luts.extend((
-            &lutties)
+        luts.extend(lutties
             .iter()
             .map(|addy| addy.to_string())
             .collect::<Vec<String>>());
-    let mut lutties = get_address_lookup_table_accounts(&triton, luts.clone());
-    println!("lutties: {:?}", lutties.len());
-    let payer_wallet = Arc::new(read_keypair_file(&*args.payer_keypair).unwrap());
+        let payer_wallet = Arc::new(read_keypair_file(&*args.payer_keypair).unwrap());
+    let lutties = get_address_lookup_table_accounts(&triton, luts.clone(), payer_wallet.pubkey());
+    //println!("lutties: {:?}", lutties.len());
 
     let slice = get_top_tokens().await.to_vec();
     
-    let mut input_mints: Vec<String> = configs.iter().map(|config| {
+    let mut input_mints: Vec<String> = configs.iter().flat_map(|config| {
 
         config.reserves
         .iter()
@@ -843,18 +852,35 @@ async fn main() {
             reserve.liquidity_token.mint.clone()
         })
     })
-    .flatten()
     .collect::<Vec<String>>();
     input_mints.shuffle(&mut rand::thread_rng());
-    input_mints.dedup();
     
+        let mut values = HashMap::new();
+        // get an initial quote of 1 usdc to input
+        for mint in &input_mints {
+
+        let url = "http://127.0.0.1:8080/quote?inputMint="
+            .to_owned()
+            +USDC+"&outputMint="
+            +&mint+"&amount=1000000";
+    
+        let quote= &reqwest::get(url.clone()).await.unwrap().text().await.unwrap();
+        let quote = serde_json::from_str::<serde_json::Value>(quote).unwrap();
+        let output_amount: String = quote["outAmount"].to_string();
+        let output_amount = ((output_amount[1..output_amount.len()-1].parse::<u64>().unwrap_or_default()) ) as f64;
+        let value: f64 = output_amount as f64;
+            if value != 0.0 {
+                let mint = mint.as_str();
+                values.insert(mint, value);
+                println!("$1.00 of {}: {}", mint, value);
+            }
+        }
 // write to file
-    let mut input_mints = input_mints.clone();
     loop {
         let mut tasks = Vec::new();
-        for i in 0..MAX_THREADS {
-            let random_mint_rng = rand::thread_rng().gen_range(0..input_mints.len());
-            let mint = input_mints[random_mint_rng].clone();
+        for _i in 0..MAX_THREADS {
+            let random_mint_rng = rand::thread_rng().gen_range(0..values.keys().collect::<Vec<&&str>>().len());
+            let mint = values.keys().collect::<Vec<&&str>>()[random_mint_rng].to_string();
             let configs = configs.clone();
             let payer_wallet = payer_wallet.clone();
             let client = client.clone();
@@ -863,23 +889,25 @@ async fn main() {
             let mut slice = slice.clone();
 
             let rng = &mut rand::thread_rng();
-            let random_number_1e9_to_1e12 = rand::thread_rng().gen_range(1e1..1e6);
+            let random_number_1e9_to_1e12 = rand::thread_rng().gen_range(10..100_000);
 
             let random_number_1e9_to_1e12 = random_number_1e9_to_1e12 as u64;
+
+            let amount = (random_number_1e9_to_1e12 as f64 * values.values().collect::<Vec<&f64>>()[random_mint_rng]) as u64;
             slice.shuffle(rng);
             let rng_slice = rand::thread_rng().gen_range(0..slice.len());
-            let mut lutties = lutties.clone();
+            let lutties = lutties.clone();
             let task = handle.spawn(async move  {
                 
-            
+                
                 // get the quote
-                doit(mint.to_string(), slice[rng_slice as usize].to_string(), &configs, &payer_wallet, &client, &triton, random_number_1e9_to_1e12,  lutties.clone() ).await
+                doit(mint.to_string(), slice[rng_slice as usize].to_string(), &configs, &payer_wallet, &client, &triton, amount,  lutties.clone() ).await
             });
         
             tasks.push(task);
         }
         
-        let results = futures::future::join_all(tasks).await;
+        let _results = futures::future::join_all(tasks).await;
     }
 
 

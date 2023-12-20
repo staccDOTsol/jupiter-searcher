@@ -39,7 +39,7 @@ pub mod jupiter_searcher {
         let signer_seeds: &[&[&[u8]]] = &[&[AUTHORITY_SEED, jarezi_arber.as_ref(), bump.as_ref()]];
 
         let jupiter_program = *ctx.accounts.jupiter_program.to_account_info().key;
-        let remaining_accounts = ctx.remaining_accounts.clone();
+        let remaining_accounts = ctx.remaining_accounts;
         let accounts: Vec<AccountMeta> = remaining_accounts
             .iter()
             .map(|acc| AccountMeta {

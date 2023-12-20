@@ -391,7 +391,7 @@ impl FunctionResult {
                 },
                 ChainResultInfo::Evm(evm) => match evm {
                     EvmFunctionResult::V0(_v) => vec![],
-                    EvmFunctionResult::V1(v) => v.function_id.as_str().as_bytes().to_vec(),
+                    EvmFunctionResult::V1(v) => v.function_id.as_bytes().to_vec(),
                 },
                 ChainResultInfo::Starknet(starknet) => match starknet {
                     StarknetFunctionResult::V0(v) => v.function_id.clone(),
@@ -425,7 +425,7 @@ impl FunctionResult {
 
     cfg_client! {
         pub fn quote(&self) -> Result<sgx_quote::Quote, SbError> {
-            sgx_quote::Quote::parse(&self.quote_bytes()).map_err(|_| SbError::QuoteParseError)
+            sgx_quote::Quote::parse(self.quote_bytes()).map_err(|_| SbError::QuoteParseError)
         }
     }
 

@@ -29,3 +29,4 @@ jupiter_searcher = {path="../../programs/jupiter_searcher"}
 tokio = "1"
 futures = "0.3.29"
 shellexpand = "3.1.0"
+round = "0.1.2"

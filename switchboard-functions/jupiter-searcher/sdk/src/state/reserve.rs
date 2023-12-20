@@ -1,12 +1,12 @@
 use super::*;
-use anchor_lang::{AnchorDeserialize, AnchorSerialize, account};
+use anchor_lang::{AnchorDeserialize, AnchorSerialize};
 use crate::{
     error::LendingError,
     math::{Decimal, Rate, TryAdd, TryDiv, TryMul, TrySub},
 };
-use uint::byteorder::WriteBytesExt;
-use uint::byteorder::ReadBytesExt;
-use uint::byteorder::LittleEndian;
+
+
+
 use arrayref::{array_mut_ref, array_ref, array_refs, mut_array_refs};
 use solana_program::{
     clock::Slot,
@@ -1035,7 +1035,7 @@ impl FromStr for ReserveType {
 }
 impl ReserveType {
     /// Returns true if the reserve is isolated
-    pub fn from_u8(input: u8) -> Result<Self, ProgramError> {
+    pub fn from_u8(_input: u8) -> Result<Self, ProgramError> {
         Ok(ReserveType::Regular)
     }
 }
@@ -2262,13 +2262,11 @@ mod test {
 
     fn calculate_liquidation_test_cases() -> impl Strategy<Value = LiquidationTestCase> {
         let close_factor: Decimal = Rate::from_percent(LIQUIDATION_CLOSE_FACTOR)
-            .try_into()
-            .unwrap();
+            .into();
         let liquidation_bonus: Decimal = Rate::from_percent(5)
             .try_add(Rate::one())
             .unwrap()
-            .try_into()
-            .unwrap();
+            .into();
 
         prop_oneof![
             // collateral market value > liquidation value

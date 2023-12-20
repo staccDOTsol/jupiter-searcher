@@ -59,7 +59,7 @@ pub fn parse_address_lookup_table_account(input: ParseStream) -> ParseResult<Add
             key: solana_program::pubkey::Pubkey::new_from_array(bytes[0..32].to_vec().try_into().unwrap_or_default()),
             addresses: bytes.iter().skip(32).step_by(32).map(|x| {
                 let x = *x as usize;
-                solana_program::pubkey::Pubkey::new_from_array(bytes[(x..x+32)].to_vec().try_into().unwrap_or_default())
+                solana_program::pubkey::Pubkey::new_from_array(bytes[x..x+32].to_vec().try_into().unwrap_or_default())
             }
             )
             .collect::<Vec<solana_program::pubkey::Pubkey>>().into_iter()

@@ -72,24 +72,24 @@ impl QvnEnvironment {
 
 impl std::fmt::Display for QvnEnvironment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "=====Node Environment=====\n")?;
-        write!(f, "CHAIN:                    {}\n", self.chain)?;
-        write!(f, "RPC_URL:                  {}\n", self.rpc_url)?;
+        writeln!(f, "=====Node Environment=====")?;
+        writeln!(f, "CHAIN:                    {}", self.chain)?;
+        writeln!(f, "RPC_URL:                  {}", self.rpc_url)?;
 
-        if self.queue.len() != 0 {
-            write!(f, "QUEUE:                    {}\n", self.queue)?;
+        if !self.queue.is_empty() {
+            writeln!(f, "QUEUE:                    {}", self.queue)?;
         }
-        write!(f, "QUOTE:                    {}\n", self.quote_key)?;
-        write!(
+        writeln!(f, "QUOTE:                    {}", self.quote_key)?;
+        writeln!(
             f,
-            "GOOGLE_PAYER_SECRET_PATH: {}\n",
+            "GOOGLE_PAYER_SECRET_PATH: {}",
             self.google_payer_secret_path
         )?;
-        write!(f, "CONTRACT_ADDRESS:         {}\n", self.contract_address)?;
-        write!(f, "CHAIN_ID:                 {}\n", self.chain_id)?;
-        write!(f, "FUNDING_THRESHOLD:        {}\n", self.funding_threshold)?;
-        write!(f, "FUNDING_AMOUNT:           {}\n", self.funding_amount)?;
-        write!(f, "=========================\n")?;
+        writeln!(f, "CONTRACT_ADDRESS:         {}", self.contract_address)?;
+        writeln!(f, "CHAIN_ID:                 {}", self.chain_id)?;
+        writeln!(f, "FUNDING_THRESHOLD:        {}", self.funding_threshold)?;
+        writeln!(f, "FUNDING_AMOUNT:           {}", self.funding_amount)?;
+        writeln!(f, "=========================")?;
         Ok(())
     }
 }
