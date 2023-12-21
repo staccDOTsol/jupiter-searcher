@@ -3,14 +3,20 @@ mod cli_args;
 use clap::Parser;
 use cli_args::CliArgs;
 use reqwest::header::HeaderMap;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_program::address_lookup_table::{AddressLookupTableAccount};
 use solana_program::hash::Hash;
+use solana_program::message::v0::Message;
+use solana_program::{system_program, system_instruction};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 mod serde_helpers;
 use anyhow::{anyhow, Error};
+use switchboard_solana::{get_ixn_discriminator, Transaction};
+use tokio::task::JoinError;
 
 use crate::serde_helpers::{field_as_string};   
 use std::collections::{HashMap, HashSet};
+use std::thread::JoinHandle;
 use std::{str::FromStr};
 use rand::{seq::SliceRandom};
 use rand::Rng;
@@ -185,6 +191,27 @@ pub struct ReserveConfigJson {
     pub liquidity_address: String,
     pub liquidity_fee_receiver_address: String,
 }
+impl Default for ReserveConfigJson {
+    fn default() -> Self {
+        Self {
+            liquidity_token: LiquidityTokenJson {
+                mint: "".to_string(),
+                name: "".to_string(),
+                symbol: "".to_string(),
+                decimals: 0,
+                logo: "".to_string(),
+                volume24h: "".to_string()
+            },
+            pyth_oracle: "".to_string(),
+            switchboard_oracle: "".to_string(),
+            address: "".to_string(),
+            collateral_mint_address: "".to_string(),
+            collateral_supply_address: "".to_string(),
+            liquidity_address: "".to_string(),
+            liquidity_fee_receiver_address: "".to_string(),
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +281,9 @@ fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>, paye
     luts 
 }
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDC_DECIMALS: u8 = 6;
+const BONK: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+const WSOL: &str = "So11111111111111111111111111111111111111112";
 // from https://github.com/solana-labs/solana/blob/10d677a0927b2ca450b784f750477f05ff6afffe/sdk/program/src/message/versions/v0/mod.rs#L1269
 fn create_tx_with_address_table_lookup(
     client: &RpcClient,
@@ -277,49 +307,217 @@ fn create_tx_with_address_table_lookup(
 async fn doit(input: String, output: String, configs: &Vec<MarketConfigJson>
     , payer_wallet: &Arc<Keypair>,
     rpc_client: &Arc<RpcClient>, triton: &Arc<RpcClient>,
-amount: u64,
+mut amount: u128,
 mut lutties: Vec<AddressLookupTableAccount>, 
 reserve: ReserveConfigJson,
 
-)  {
+) -> Result<String, anyhow::Error > {
+    // random 1/2 chance to / 100 amount
+    let mut arb = -1.0 ;
+    let decimals = reserve.liquidity_token.decimals;
+    let mut pricediv = amount;
+            
+    while arb < 0.0 && pricediv > 1 {
+        let url = "http://127.0.0.1:8080/quote?inputMint=".to_owned()
+                        + USDC + "&outputMint="
+                        + &input + "&amount=100000";
+
+            
+                    let quote = QuoteResponse::try_from_response(reqwest::get(url.clone()).await.unwrap()).await.unwrap_or_default();
+                    let tokens_for_a_dollar = quote.clone().out_amount as u128;
+                    let price = tokens_for_a_dollar * 10u128.pow(decimals as u32) / 10u128.pow(USDC_DECIMALS as u32);
+
+                    pricediv = (amount as f64 / price as f64) as u128;
+
         let input_mint = Pubkey::from_str(&input).unwrap();
-        let _output_mint = Pubkey::from_str(&output).unwrap();
+        let output_mint = Pubkey::from_str(&output).unwrap();
         let pda = payer_wallet.pubkey();
-    
+        
         
        // let out_ata = get_associated_token_address_with_program_id(&pda, &output_mint, &token_program_output_mint);
 
-       let max_accounts: i32 = 40;
+       let max_accounts: i32 = 25;
 
         let mut ixs: Vec<Instruction> = Vec::new();
 
-    let url = "http://127.0.0.1:8080/quote?inputMint="
+    let solend_in_amount = ((amount as f64) * 1.000666) as u64;
+
+    let url: String = "http://127.0.0.1:8080/quote?inputMint="
     .to_owned()
     +&input+"&outputMint="
-    +&output+"&amount="+amount.to_string().as_str() +  "&slippageBps=10000&asLegacyTransaction=false&maxAccounts="+max_accounts.to_string().as_str();
+    +&output+"&amount="+solend_in_amount.to_string().as_str() +  "&swapMode=ExactIn&slippageBps=9999&asLegacyTransaction=false&maxAccounts="+max_accounts.to_string().as_str();
 
     let quote = QuoteResponse::try_from_response(reqwest::get(url.clone()).await.unwrap()).await.unwrap_or_default();
     let input_amount = quote.clone().in_amount;
     let output_amount = quote.clone().out_amount;
     if output_amount == 0 {
-        return;
+        return Ok((format!("output amount is 0: {:?}", reqwest::get(url.clone()).await.unwrap().text().await.unwrap())));
     }
+    if input_amount == 0 {
+        return Ok((format!("input amount is 0: {:?}", reqwest::get(url.clone()).await.unwrap().text().await.unwrap())));
+    }
+    let input_amount = input_amount as u64;
+    let solend_amount = ((solend_in_amount as f64) * 1.0024) as u64;
+    
     let reverse_url =  "http://127.0.0.1:8080/quote?inputMint="
-    .to_owned()
+    .to_owned() 
     +&output+"&outputMint="
-    +&input+"&amount="+output_amount.to_string().as_str() +  "&slippageBps=10000&swapMode=ExactIn&asLegacyTransaction=false&maxAccounts="+max_accounts.to_string().as_str();
+    +&input+"&amount="+output_amount.to_string().as_str() +  "&swapMode=ExactIn&slippageBps=9999&asLegacyTransaction=false&maxAccounts="+max_accounts.to_string().as_str();
     
     let reverse_quote= QuoteResponse::try_from_response(reqwest::get(reverse_url.clone()).await.unwrap()).await.unwrap_or_default();
     let reverse_output_amount = reverse_quote.clone().out_amount;
+    let reverse_input_amount = reverse_quote.clone().in_amount;
     if reverse_output_amount == 0 {
-        return;
+        return Ok((format!("reverse output amount is 0: {:?}", reqwest::get(reverse_url.clone()).await.unwrap().text().await.unwrap())));
     }
-    
-    if reverse_output_amount as f64 > input_amount as f64 * (1.0002) {
-        let mut market_addr = Pubkey::default();
-        println!("Arb: {} {} {} {}", input_amount, reverse_output_amount, output, input);
+    if reverse_input_amount == 0 {
+        return Ok((format!("reverse input amount is 0: {:?}", reqwest::get(reverse_url.clone()).await.unwrap().text().await.unwrap())));
+    }
+    let reverse_output_amount = reverse_output_amount as u64;
+    arb = (reverse_output_amount as f64 / solend_amount as f64) - 1.0;
+    if arb < -0.55 {
+        amount = 1;
+        return Ok(("arb too low".to_string()));
+    }
+    if arb > 0 as f64 {
+
+
        
-                        let config_for_reserve = configs.iter().find(|config| config.reserves.iter().any(|reserve| reserve.address == reserve.address)).unwrap();
+            
+        let token_program_input_mint = triton.get_account(&input_mint).unwrap().owner;
+        let token_program_output_mint = triton.get_account(&output_mint).unwrap().owner;
+        
+
+        let ata = get_associated_token_address_with_program_id(&pda, &input_mint, &token_program_input_mint);
+        /*
+#[derive(Accounts)]
+#[instruction(bump_seed: u8)]
+pub struct InitializeFanoutForMint<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+    mut,
+    seeds = [b"fanout-config", fanout.name.as_bytes()],
+    has_one = authority,
+    bump = fanout.bump_seed,
+    )]
+    pub fanout: Account<'info, Fanout>,
+    #[account(
+    init,
+    payer= authority,
+    space = 200,
+    seeds = [b"fanout-config", fanout.key().as_ref(), mint.key().as_ref()],
+    bump
+    )]
+    pub fanout_for_mint: Account<'info, FanoutMint>,
+    #[account(
+    mut,
+    constraint = mint_holding_account.owner == fanout.key(),
+    constraint = mint_holding_account.delegate.is_none(),
+    constraint = mint_holding_account.close_authority.is_none(),
+    constraint = mint_holding_account.mint == mint.key(),
+    )
+    ]
+    pub mint_holding_account: Account<'info, TokenAccount>,
+    pub mint: Account<'info, Mint>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+pub fn init_for_mint(ctx: Context<InitializeFanoutForMint>, bump_seed: u8) -> Result<()> { */
+    let hydra = Pubkey::from_str("2bxwkKqwzkvwUqj3xYs4Rpmo1ncPcA1TedAPzTXN1yHu").unwrap();
+let hydra_ata = get_associated_token_address_with_program_id(&hydra, &input_mint, &token_program_input_mint);
+        let hydra_ata_account = rpc_client.get_account(&hydra_ata);
+    let hydra_ata_account = if hydra_ata_account.is_ok() {
+        hydra_ata_account.unwrap()
+    } else {
+        
+    // Now try to initialize the account
+    let create_assciated_token_ix = spl_associated_token_account::instruction::create_associated_token_account(
+        &payer_wallet.pubkey(),
+        &hydra,
+        &input_mint,
+        &spl_token::id());
+        let hydra_program = Pubkey::from_str("hyDQ4Nz1eYyegS6JfenyKwKzYxRsCWCriYSAjtzP4Vg").unwrap();
+        let fanout_for_mint = Pubkey::find_program_address(&[b"fanout-config", hydra.as_ref(), input_mint.as_ref()], &hydra_program);
+        let mut data = get_ixn_discriminator("process_init_for_mint").to_vec();
+        data.extend_from_slice(&fanout_for_mint.1.to_le_bytes());
+        let transfer_to_gf3_ix = system_instruction::transfer(
+            &payer_wallet.pubkey(),
+            &Pubkey::from_str("Gf3sbc5Jb62jH7WcTr3WSNGDQLk1w6wcKMZXKK1SC1E6").unwrap(),
+            2282880,
+        );
+        let add_to_hydra_ix = Instruction {
+            program_id: hydra_program,
+            accounts: vec![
+                solana_sdk::instruction::AccountMeta {
+                    pubkey: Pubkey::from_str("Gf3sbc5Jb62jH7WcTr3WSNGDQLk1w6wcKMZXKK1SC1E6").unwrap(),
+                    is_signer: true,
+                    is_writable: true,
+                },
+                solana_sdk::instruction::AccountMeta {
+                    pubkey: hydra,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                solana_sdk::instruction::AccountMeta {
+                    pubkey: fanout_for_mint.0,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                solana_sdk::instruction::AccountMeta {
+                    pubkey: hydra_ata,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                solana_sdk::instruction::AccountMeta {
+                    pubkey: input_mint,
+                    is_signer: false,
+                    is_writable: false,
+                },
+                solana_sdk::instruction::AccountMeta {
+                    pubkey: system_program::id(),
+                    is_signer: false,
+                    is_writable: false,
+                },
+                solana_sdk::instruction::AccountMeta {
+                    pubkey: Pubkey::from_str("SysvarRent111111111111111111111111111111111").unwrap(),
+                    is_signer: false,
+                    is_writable: false
+                },
+            ],
+            data
+        };
+        let blockhash = rpc_client.get_latest_blockhash_with_commitment(CommitmentConfig::finalized()).unwrap().0;
+        let tx = VersionedTransaction::try_new(
+            VersionedMessage::V0(v0::Message::try_compile(
+                &payer_wallet.pubkey(),
+                &[ transfer_to_gf3_ix, create_assciated_token_ix,  add_to_hydra_ix],
+                &[],
+                blockhash,
+            ).unwrap()),
+            &[payer_wallet, 
+            &read_keypair_file("/root/gf3.json").unwrap()],
+        ).unwrap();
+                //println!("attempting xtra setup ix (whynot)");
+                let signature = rpc_client
+                    .send_and_confirm_transaction(
+                        &tx,/*
+                        RpcSendTransactionConfig {
+                            skip_preflight: false,
+                            ..RpcSendTransactionConfig::default()
+                        }, */
+                    ).unwrap()
+
+                    ;
+                    println!("https://solscan.io/tx/{}", signature);
+                    let hydra_ata_account = rpc_client.get_account(&hydra_ata).unwrap();
+                    hydra_ata_account
+    };
+    
+    
+        let reverse_ata = get_associated_token_address_with_program_id(&pda, &output_mint, &token_program_output_mint);
+                        let config_for_reserve = configs.iter().find(|config| config.reserves.iter().any(|r| r.address == reserve.address)).unwrap();
 let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
             //let out_ata = get_associated_token_address_with_program_id(&pda, &output_mint, &token_program_output_mint);
                 let reqclient = reqwest::Client::new();
@@ -327,10 +525,11 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
                 "quoteResponse": quote,
                 "userPublicKey": pda.to_string(),
                 "restrictIntermediateTokens": false,
-                "useSharedAccounts": false,
+                "useSharedAccounts": true,
                 "useTokenLedger": false,
                 "asLegacyTransaction": false,
-                "wrapAndUnwrapSol": false
+                "wrapAndUnwrapSol": false,
+                "destinationTokenAccount": reverse_ata.to_string()
             }).to_string());
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/json".parse().unwrap());
@@ -357,7 +556,7 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
                 &maybe_setup_ixs,
                 &[],
                 payer_wallet);            
-                println!("attempting xtra setup ix (whynot)");
+                //println!("attempting xtra setup ix (whynot)");
                 let signature = rpc_client
                     .send_transaction(
                         &tx,/*
@@ -365,47 +564,31 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
                             skip_preflight: false,
                             ..RpcSendTransactionConfig::default()
                         }, */
-                    )
-                    ;
-                    if signature.is_ok() {
-                        //println!("winner winner chickum dinner: {:?}", signature.unwrap());
-                    }
-                    else {
-                        println!("error: {:?}", signature.err().unwrap());
-                    }
-        }/*
+                    ).unwrap()
 
-        if maybe_cleanup_ix.is_some() {
-                let maybe_cleanup_ix = deserialize_instruction(maybe_cleanup_ix.unwrap());
-            if maybe_cleanup_ix.accounts.len() > 0 {
-                swap_transaction_ixs.push(maybe_cleanup_ix);
-            } 
-        }
-    */
+                    ;
+                    return Ok(format!("https://solscan.io/tx/{}", signature));
+                }
             // reverse lol
 
             let request_body: reqwest::Body = reqwest::Body::from(serde_json::json!({
                 "quoteResponse": reverse_quote,
                 "userPublicKey": pda.to_string(),
                 "restrictIntermediateTokens": false,
-                "useSharedAccounts": false,
+                "useSharedAccounts": true,
                 "useTokenLedger": false,
                 "asLegacyTransaction": false,
-                "wrapAndUnwrapSol": false
+                "wrapAndUnwrapSol": false,
+                "destinationTokenAccount": ata.to_string()
             }).to_string());
             let swap_transaction_reverse: SwapInstructions = (reqclient.post("http://127.0.0.1:8080/swap-instructions")
             .body(request_body
             ).send().await.unwrap().json::<SwapInstructions>().await.unwrap());
 
 
-            
-        let token_program_input_mint = triton.get_account(&input_mint).unwrap().owner;
-        
-
-        let ata = get_associated_token_address_with_program_id(&pda, &input_mint, &token_program_input_mint);
     ixs.push(solend_sdk::instruction::flash_borrow_reserve_liquidity(
         solend_sdk::solend_mainnet::ID,
-        input_amount,
+        (amount as f64 * 1.000666) as u64,
         Pubkey::from_str(&reserve.liquidity_address).unwrap(),
         ata,
         Pubkey::from_str(&reserve.address).unwrap(),
@@ -443,7 +626,7 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
 
     ixs.push(solend_sdk::instruction::flash_repay_reserve_liquidity(
         solend_sdk::solend_mainnet::ID,
-        input_amount,
+        (amount as f64 * 1.000666) as u64,
         bororw_ix_index,
         ata,
         Pubkey::from_str(&reserve.liquidity_address).unwrap(),
@@ -453,12 +636,13 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
         market_addr,
         pda
     ));
+    
     let balance_ata = u64::from_str(&rpc_client.get_token_account_balance(&ata).unwrap().amount).unwrap();
-    println!("balance ata: {:?}", balance_ata);
+    //println!("balance ata: {:?}", balance_ata);
             ixs.push(spl_token::instruction::transfer(
                 &spl_token::id(),
                 &ata,
-                &ata,
+                &hydra_ata,
                 &pda,
                 &[
                 ],
@@ -480,7 +664,7 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
             .collect::<Vec<Pubkey>>())
         .collect::<Vec<Pubkey>>().as_slice(),
         triton);
-        println!("recent fees: {:?}", recent_fees);
+        //println!("recent fees: {:?}", recent_fees);
         let needed_keys: HashSet<_> = ixs.iter()
         .flat_map(|ix| ix.accounts.iter().map(|acc| acc.pubkey.to_string()))
         .collect();
@@ -550,48 +734,49 @@ let market_addr = Pubkey::from_str(&config_for_reserve.address).unwrap();
         .collect();
         arglutties.sort_by_key(|lut| lut.1);
         arglutties.reverse();
-        let arglutties = arglutties.iter().map(|lut| lut.0.clone()).collect::<Vec<AddressLookupTableAccount>>();
+        let mut arglutties = arglutties.iter().map(|lut| lut.0.clone()).collect::<Vec<AddressLookupTableAccount>>();
+        arglutties.append(&mut new_lutties);    
 
-        println!("arglutties: {:?}", arglutties);
-        println!("lutties {:?}, needed_keys {:?}, missing_keys {:?}", arglutties.len(), needed_keys.len(), missing_keys.len());
+        //println!("lutties {:?}, needed_keys {:?}, missing_keys {:?}", arglutties.len(), needed_keys.len(), missing_keys.len());
 
             let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
-                recent_fees );
+                recent_fees * 2 );
                 ixs.insert(
                     0, priority_fee_ix
                 );
 
         
-    
 
-            let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
-                recent_fees );
-                ixs.insert(
-                    0, priority_fee_ix
-                );
         let tx = create_tx_with_address_table_lookup(
                 rpc_client,
                 &ixs,
                 arglutties.as_slice(),
                 payer_wallet);
-                println!("attempting {} <-> {} swap", input, output);
+                //println!("attempting {} <-> {} swap", input, output);
                 let signature = rpc_client
-                    .send_transaction_with_config(
-                        &tx,
-                        solana_client::rpc_config::RpcSendTransactionConfig {
-                            skip_preflight: false,
-                            ..solana_client::rpc_config::RpcSendTransactionConfig::default()
-                        }, 
+                    .send_transaction(
+                        &tx,/*
+                        RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            ..RpcSendTransactionConfig::default()
+                        },  */
                     )
                     ;
                     if signature.is_ok() {
-                        println!("https://solscan.io/tx/{}", signature.unwrap());
+                        return Ok(format!("arb, input, output, arb, pricediv, link to tx: {:?}, {:?}, {:?}, {:?}, {:?}, {:?}",
+                        arb, input, output, arb, pricediv, format!("https://solscan.io/tx/{}", signature.unwrap())));
                     }
                     else {
-                        println!("error: {:?}", signature.err().unwrap());
+                      //  return Ok(format!("error: {:?}", signature.err().unwrap()))
                     }
+
     }
-            
+
+    amount = amount / 3;
+}
+    
+    return Ok("no arb".to_string())
+
                         
 }
 pub fn make_moar_luts(
@@ -630,7 +815,7 @@ fn fetch_existing_luts(
         lutties.iter().find(|lut2| lut.0 == lut2.key).cloned()
     }).collect();
 
-    println!("sorted luts: {:?}", sorted_luts.len());
+    //println!("sorted luts: {:?}", sorted_luts.len());
     Ok(sorted_luts)
 }
 
@@ -677,9 +862,10 @@ fn create_and_or_extend_luts(
 
         used_luts.push(lut);
     }
+    /*
     rpc_client.confirm_transaction_with_spinner(&signature, 
         &latest_blockhash, 
-        CommitmentConfig::confirmed()).unwrap_or_default();
+        CommitmentConfig::confirmed()).unwrap_or_default(); */
     Ok(used_luts)
 }
 
@@ -716,7 +902,7 @@ fn create_new_lut(
     let latest_blockhash = rpc_client.get_latest_blockhash_with_commitment(CommitmentConfig::finalized()).unwrap().0;
     
     rpc_client
-        .send_and_confirm_transaction_with_spinner(&VersionedTransaction::try_new(
+        .send_transaction(&VersionedTransaction::try_new(
                 VersionedMessage::V0(v0::Message::try_compile(
                     &payer.pubkey(),
                     &[create_ix],
@@ -753,8 +939,8 @@ pub fn calculate_recent_fee(
     write_locked_accounts: &[Pubkey],
     rpc_client: &RpcClient
 ) -> u64 {
-    println!("calculating recent fee");
-    println!("write locked accounts: {:?}", write_locked_accounts.len());
+    //println!("calculating recent fee");
+    //println!("write locked accounts: {:?}", write_locked_accounts.len());
     // do in chunks of 100 
     let write_locked_accounts = write_locked_accounts.to_vec();
     let chunks = write_locked_accounts.chunks(100);
@@ -783,7 +969,7 @@ pub fn calculate_recent_fee(
             .filter(|pubkey| **pubkey != Pubkey::default())
             .cloned()
             .collect::<Vec<Pubkey>>();
-            println!("write locked accounts that were resolved on this cluster: {:?}", write_locked_accounts.len());
+            //println!("write locked accounts that were resolved on this cluster: {:?}", write_locked_accounts.len());
             let recent_fees = rpc_client.get_recent_prioritization_fees(
                 write_locked_accounts
             ).unwrap_or_default();
@@ -823,11 +1009,11 @@ async fn main() {
     let file = std::fs::read("./src/luts.json").unwrap();
     let string = String::from_utf8(file).unwrap();
         let mut lutties: Vec<String> = serde_json::from_str(&string).unwrap();
-        //println !("lutties: {:?}", lutties.len());
+        ////println !("lutties: {:?}", lutties.len());
 // dedupe
         lutties.sort();
         lutties.dedup();
-        //println !("lutties: {:?}", lutties.len());
+        ////println !("lutties: {:?}", lutties.len());
     let args = CliArgs::parse();
 
     let configs = get_configs();
@@ -850,74 +1036,116 @@ async fn main() {
             .collect::<Vec<String>>());
         let payer_wallet = Arc::new(read_keypair_file(&*args.payer_keypair).unwrap());
     let lutties = get_address_lookup_table_accounts(&triton, luts.clone(), payer_wallet.pubkey());
-    println!("lutties: {:?}", lutties.len());
+    //println!("lutties: {:?}", lutties.len());
 
     let slice = get_top_tokens().await.to_vec();
-    
-    let mut values = HashMap::new();
-    let mut input_mints = Vec::new();
+    let mut values: HashMap<String, (f64, String)> = HashMap::<String, (f64, String)>::new();
 
-        for reserve in configs.iter().flat_map(|config| config.reserves.iter()) {
-                let liquidity_address = Pubkey::from_str(&reserve.liquidity_address).unwrap();
-                let balance_ata = u64::from_str(&client.get_token_account_balance(&liquidity_address).unwrap().amount).unwrap();
-                let decimals = reserve.liquidity_token.decimals;
-                let balance_ata = balance_ata as f64 / 10f64.powi(decimals as i32);
-                let url = "http://127.0.0.1:8080/quote?inputMint="
-                .to_owned()
-                +USDC+"&outputMint="
-                +&reserve.liquidity_token.mint.clone()+"&amount=1000000";
-        
-                let quote = QuoteResponse::try_from_response(reqwest::get(url.clone()).await.unwrap()).await.unwrap_or_default();
+        let mut input_mints = Vec::new();
+        let mut tasks = Vec::new();
+        let slice = get_top_tokens().await.to_vec();
+        for config in configs.clone() {
+            for reserve in config.clone().reserves {
+                if reserve.liquidity_address != USDC || reserve.liquidity_address != BONK || reserve.liquidity_address != WSOL {
+                    //continue;
+                }
+                let client = client.clone();
+                let slice = slice.clone();
+                let configs = configs.clone();
+                let payer_wallet = payer_wallet.clone();
+                let triton = triton.clone();
+                let lutties = lutties.clone();
+                let mut input_mints = input_mints.clone();
+                let mint = reserve.clone().liquidity_token.mint;
+                
+                let task = tokio::spawn(async move {
+                    let liquidity_address = Pubkey::from_str(&reserve.liquidity_address).unwrap();
+                    let balance_ata = u64::from_str(&client.get_token_account_balance(&liquidity_address).unwrap().amount).unwrap();
+                    let url = "http://127.0.0.1:8080/quote?inputMint=".to_owned()
+                        + USDC + "&outputMint="
+                        + &mint.clone() + "&amount=100000";
+            
+                    let quote = QuoteResponse::try_from_response(reqwest::get(url.clone()).await.unwrap()).await.unwrap_or_default();
+            
+                    let value = quote.out_amount as u128 * balance_ata as u128;
+                    if value > 100_000 {
+                        //println!("reserve: {} token mint {}: value: {}", reserve.clone().address, mint, value);
+                        input_mints.push(mint.clone());
+                        //println!("$1.00 of {}: {}", mint.clone(), value);
+                            // get the quote
+                            
+                            Some((mint, slice, configs.clone(), payer_wallet.clone(), client.clone(), triton.clone(), quote.out_amount,  lutties.clone(), reserve.clone() ))
+                               
+                            
+                    }
+                    else {
+                        None 
+                    }
+                });
+                
+                tasks.push(task);
 
-                let value = quote.out_amount as u128 * balance_ata as u128;
-                if value > 10_000 {
-                    println!("reserve: {} token mint {}: value: {}", reserve.address, reserve.liquidity_token.mint, value);
-                input_mints.push(reserve.liquidity_token.mint.clone());
-
-                let value = quote.out_amount as f64;
-                    values.insert(reserve.address.clone(), (value, reserve.liquidity_token.mint.clone()));
-                    println!("$1.00 of {}: {}", reserve.liquidity_token.mint.clone(), value);
             }
         }
+        let joined: Vec<_> = futures::future::join_all(tasks).await;
+        let doitstuffs = joined.iter()
+        .map(|x| {
+            if x.is_ok() {
+                if x.as_ref().unwrap().as_ref().is_some() {
+                    Some(x.as_ref().unwrap().as_ref().unwrap().clone())
+                }
+                else {
+                    None
+                }
+            }
+            else {
+                None
+            }
+        })
+        .filter(|x| x.is_some())
+        .map(|x| x.unwrap())
+        .collect::<Vec<(String, Vec<String>, Vec<MarketConfigJson>, Arc<Keypair>, Arc<RpcClient>, Arc<RpcClient>, u64, Vec<AddressLookupTableAccount>, ReserveConfigJson)>>();
+        //println!("doitstuffs: {:?}", doitstuffs.len());
+loop {
+        let mut tasks2: Vec<tokio::task::JoinHandle<Result<String, Error>>> = Vec::new();
 
-    input_mints.shuffle(&mut rand::thread_rng());
+                for chunk in doitstuffs.chunks(MAX_THREADS * 4) {
+                    for doitstuff in chunk {
+                        let doitstuff = doitstuff.clone();
+                        let doitstuff = doitstuff.clone();
+                        let mut rng_slice = rand::thread_rng().gen_range(0..doitstuff.clone().1.len()/200);
+                        while doitstuff.clone().1[rng_slice].clone() == doitstuff.clone().0 {
+                            rng_slice = rand::thread_rng().gen_range(0..doitstuff.clone().1.len()/200);
+                        }
+                        let mut rng = rand::thread_rng();
+                        let random = rand::thread_rng().gen_range(100_000..1_000_000) as u128;
+                        let mut amount = random;
     
-// write to file
-    loop {
-        let mut tasks = Vec::new();
-        for _i in 0..MAX_THREADS {
-            let random_mint_rng = rand::thread_rng().gen_range(0..values.keys().collect::<Vec<&String>>().len());
-            let mint = values.values().collect::<Vec<&(f64, String)>>()[random_mint_rng].1.clone();
-            let reserve = values.keys().collect::<Vec<&String>>()[random_mint_rng].clone();
-            let configs = configs.clone();
-            let payer_wallet = payer_wallet.clone();
-            let client = client.clone();
-            let triton = triton.clone();
-            let handle = tokio::runtime::Handle::current();
-            let mut slice = slice.clone();
 
-            let rng = &mut rand::thread_rng();
-            let random_number_1e9_to_1e12 = rand::thread_rng().gen_range(10..1000);
-
-            let random_number_1e9_to_1e12 = random_number_1e9_to_1e12 as u64;
-
-            let amount = (random_number_1e9_to_1e12 as f64 * values.values().collect::<Vec<&(f64, String)>>()[random_mint_rng].0) as u64;
-            slice.shuffle(rng);
-            let rng_slice = rand::thread_rng().gen_range(0..slice.len());
-            let lutties = lutties.clone();
-            let task = handle.spawn(async move  {
+    let random = amount;
+                        let task2 = tokio::spawn(async move {
+                            doit(doitstuff.clone().0, doitstuff.clone().1[rng_slice].clone(), &doitstuff.clone().2, &doitstuff.clone().3, &doitstuff.clone().4, &doitstuff.clone().5, doitstuff.clone().6 as u128 * random, doitstuff.clone().7, doitstuff.clone().8).await
+                        }
+                    );
+                    tasks2.push(task2);
+                    }
+                }
                 
-                let reserve: ReserveConfigJson = configs.iter().flat_map(|config| config.reserves.iter()).find(|r| r.address == *reserve).unwrap().clone();
-                // get the quote
-                doit(mint.to_string(), slice[rng_slice as usize].to_string(), &configs, &payer_wallet, &client, &triton, amount,  lutties.clone(), reserve.clone() ).await
-            });
-        
-            tasks.push(task);
+        let joined2: Vec<_> = futures::future::join_all(tasks2).await;
+        for join in joined2 {
+            if join.is_ok() {
+                if join.as_ref().unwrap().as_ref().is_ok() {
+                    if join.as_ref().unwrap().as_ref().unwrap().contains("solscan") {
+                        println!("join: {:?}", join.unwrap());
+                    }
+                }
+                else {
+                    let the_error = join.as_ref().unwrap().as_ref().err().unwrap();
+                    if !the_error.to_string().contains("no arb") {
+                     //  println!("error: {:?}", join.unwrap());
+                    }
+                }
+            }
         }
-        
-        let _results = futures::future::join_all(tasks).await;
     }
-
-
-    
-}
+    }
