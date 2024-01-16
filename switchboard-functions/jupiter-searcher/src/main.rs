@@ -1,17 +1,29 @@
 
 mod cli_args;
+use anchor_client::Client;
+use anchor_client::anchor_lang::{system_program, ToAccountMetas, InstructionData};
 use clap::Parser;
 use cli_args::CliArgs;
+use marginfi::state::marginfi_account::{MarginfiAccount};
+use marginfi::state::marginfi_group::{Bank, BankVaultType};
+use marginfi::utils::find_bank_vault_authority_pda;
 use reqwest::header::HeaderMap;
-use solana_program::program_pack::Pack;
-use solana_program::address_lookup_table::{AddressLookupTableAccount};
+use serde_json::json;
+use solana_client::rpc_filter::{RpcFilterType, Memcmp};
+use solana_program::address_lookup_table_account::AddressLookupTableAccount;
+use solana_program::instruction::{AccountMeta, InstructionError};
+use solana_program::slot_hashes::{SlotHashes, MAX_ENTRIES};
+use solana_program::slot_history::Slot;
+use solana_sdk::commitment_config::CommitmentLevel;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use switchboard_solana::{Transaction};
-use std::collections::{HashMap, HashSet};
+use solana_sdk::signature::Signature;
+use std::borrow::Cow;
+
+use std::mem::size_of;
 use std::{str::FromStr};
 use rand::{seq::SliceRandom};
 use rand::Rng;
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 
 use solana_program::message::{VersionedMessage, v0};
 use serde::{Serialize, Deserialize};
@@ -64,6 +76,7 @@ pub struct LiquidityTokenJson {
     pub logo: String,
     pub volume24h: String
 }
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ReserveConfigJson {
@@ -112,7 +125,7 @@ fn deserialize_instruction (instruction: HashedIx) -> Instruction {
     };
     instruction
 }
-fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>, payer: Pubkey) -> Vec<AddressLookupTableAccount> {
+async fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>, payer: Pubkey) -> Vec<AddressLookupTableAccount> {
     let keys = &keys.iter().
     map(|key| {
         Pubkey::from_str(key).unwrap()
@@ -124,12 +137,14 @@ fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>, paye
     let  chunks= keys.chunks(100);
     
     for chunk in chunks {
-            let raw_accounts = client.get_multiple_accounts(&chunk).unwrap();
+            let raw_accounts = client.get_multiple_accounts(chunk).await.unwrap();
 
             for i in 0..raw_accounts.len() {
                 if raw_accounts[i].is_some() {
                     let raw_account = raw_accounts[i].as_ref().unwrap();
-                    let address_lookup_table = solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&raw_account.data).unwrap();
+
+                    let address_lookup_table = AddressLookupTable::deserialize(&raw_account.data).unwrap();
+
                     if address_lookup_table.meta.authority.unwrap() == payer {
                         let address_lookup_table_account = AddressLookupTableAccount {
                             key: chunk[i],
@@ -144,131 +159,262 @@ fn get_address_lookup_table_accounts(client: &RpcClient, keys: Vec<String>, paye
     
     luts 
 }
-const USDC: &str = ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 // from https://github.com/solana-labs/solana/blob/10d677a0927b2ca450b784f750477f05ff6afffe/sdk/program/src/message/versions/v0/mod.rs#L1269
-fn create_tx_with_address_table_lookup(
+async fn create_tx_with_address_table_lookup(
     client: &RpcClient,
     instructions: &[Instruction],
     luts: &[AddressLookupTableAccount],
     payer: &Keypair,
 ) -> VersionedTransaction {
 
-    let blockhash = client.get_latest_blockhash().unwrap();
+    let blockhash = client.get_latest_blockhash().await.unwrap();
     VersionedTransaction::try_new(
         VersionedMessage::V0(v0::Message::try_compile(
             &payer.pubkey(),
             instructions,
-            &luts,
+            luts,
             blockhash,
         ).unwrap()),
         &[payer],
     ).unwrap()
 }
 
-async fn doit(input: String, output: String, configs: &Vec<MarketConfigJson>
+pub async fn load_observation_account_metas(
+    include_banks: Vec<(Pubkey, Bank)>,
+    account: (Pubkey, MarginfiAccount),
+) -> Vec<AccountMeta> {
+    let marginfi_account = account.1;
+    let mut bank_pks = marginfi_account
+        .lending_account
+        .balances
+        .iter()
+        .filter_map(|balance| {
+            if balance.active {
+                Some(balance.bank_pk)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for bank_pk in include_banks.clone() {
+        if !bank_pks.contains(&bank_pk.0) {
+            bank_pks.push(bank_pk.0);
+        }
+    }
+//    bank_pks.retain(|bank_pk| !exclude_banks.contains(bank_pk));
+
+    let mut banks = vec![];
+    for bank_pk in bank_pks.clone() {
+        for bank in include_banks.clone() {
+            if bank.0 == bank_pk {
+                banks.push(bank.1);
+            }
+        }
+    }
+
+    let account_metas = banks
+        .iter()
+        .zip(bank_pks.iter())
+        .flat_map(|(bank, bank_pk)| {
+            vec![
+                AccountMeta {
+                    pubkey: *bank_pk,
+                    is_signer: false,
+                    is_writable: false,
+                },
+                AccountMeta {
+                    pubkey: bank.config.oracle_keys[0],
+                    is_signer: false,
+                    is_writable: false,
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    account_metas
+}
+
+pub async fn make_bank_borrow_ix(
+    funding_account: Pubkey,
+    bank: &(Pubkey, Bank),
+    marginfi_account: &(Pubkey, MarginfiAccount),
+    destination_account: Pubkey,
+    amount: u64
+) -> Instruction {
+    let mut ix = Instruction {
+        program_id: marginfi::id(),
+        accounts: marginfi::accounts::LendingAccountBorrow {
+            marginfi_group: marginfi_account.clone().1.group,
+            marginfi_account: marginfi_account.clone().0,
+            signer: funding_account ,
+            bank: bank.0,
+            destination_token_account: destination_account,
+            bank_liquidity_vault: bank.clone().1.liquidity_vault,
+            bank_liquidity_vault_authority: find_bank_vault_authority_pda(
+                &bank.clone().0,
+                BankVaultType::Liquidity,
+            )
+            .0,
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(Some(true)),
+        data: marginfi::instruction::LendingAccountBorrow {
+            amount
+        }
+        .data(),
+    };
+    ix.accounts.extend_from_slice(
+        &load_observation_account_metas(vec![*bank], marginfi_account.clone())
+            .await,
+    );
+
+    ix
+}
+
+pub async fn make_bank_deposit_ix(
+    funding_account: Pubkey,
+    funding_account_ata: Pubkey,
+    bank: &(Pubkey, Bank),
+    marginfi_account: &(Pubkey, MarginfiAccount),
+    amount: u64
+) -> Instruction {
+
+    Instruction {
+        program_id: marginfi::id(),
+        accounts: marginfi::accounts::LendingAccountDeposit {
+            marginfi_group: marginfi_account.clone().1.group,
+            marginfi_account: marginfi_account.clone().0,
+            signer: funding_account.clone(),
+            bank: bank.clone().0,
+            signer_token_account: funding_account_ata,
+            bank_liquidity_vault: bank.clone().1.liquidity_vault,
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(Some(true)),
+        data: marginfi::instruction::LendingAccountDeposit {
+            amount
+        }
+        .data(),
+    }
+}
+async fn doit(input: String, output: String, banks: &Vec<(Pubkey, Bank)>    
     , payer_wallet: &Arc<Keypair>,
     rpc_client: &Arc<RpcClient>, triton: &Arc<RpcClient>,
 amount: u64,
-mut lutties: Vec<AddressLookupTableAccount>
+mut lutties: Vec<AddressLookupTableAccount>, account: (Pubkey, MarginfiAccount)
 
 )  {
-        let input_mint = Pubkey::from_str(&input).unwrap();
-        let output_mint = Pubkey::from_str(&output).unwrap();
-        let pda = payer_wallet.pubkey();
-        let decimals_input = configs.
-        into_iter()
-        .map(|config| {
-            for reserve in config.reserves.clone().into_iter() {
-                if reserve.liquidity_token.mint == input {
-                    return reserve.liquidity_token.decimals as u32;
-                }
-            }
-            0 as u32
-        })
-        .collect::<Vec<u32>>()[0];
-    
-        
+    let pona = Keypair::from_base58_string("KkWmJYBZ5JEzMEhwfjdB7xgSMLCF1PiZwrte6T3PAUtEMnMfbYfaAWoa3PVo35f6eDqUqadx1K3Cpx268D71TxM");
 
+        let input_mint = Pubkey::from_str(&input).unwrap();
+        let pda = payer_wallet.pubkey();
+        let input_bank = banks.iter().find(|bank| bank.1.mint == input_mint);
+        if input_bank.is_none() {
+            return;
+        }
+        let input_bank = input_bank.unwrap();
+        let input_decimals = input_bank.1.mint_decimals;
+        let amount = amount * 10u64.pow(input_decimals as u32);
        // let out_ata = get_associated_token_address_with_program_id(&pda, &output_mint, &token_program_output_mint);
 
        
 
         let mut ixs: Vec<Instruction> = Vec::new();
-
-        // get an initial quote of 1 usdc to input
-
-        let url = "http://127.0.0.1:8080/quote?slippageBps=10000&asLegacyTransaction=true&inputMint="
+        /*
+        let url = "http://127.0.0.1:8080/quote?slippageBps=9999&asLegacyTransaction=false&inputMint="
         .to_owned()
         +&USDC.to_string()+"&outputMint="
-        +&input+"&amount=1000000";
+        +&input+"&amount=10000";
     
         let quote= (&reqwest::get(url.clone()).await.unwrap().text().await.unwrap());
         let quote = serde_json::from_str::<serde_json::Value>(&quote).unwrap();
         let output_amount: String = quote["outAmount"].to_string();
         let output_amount = ((output_amount[1..output_amount.len()-1].parse::<u64>().unwrap_or_default()) ) as f64;
+        if output_amount == 0.0 {
+            return;
+        }
         let value = output_amount as f64;
-        let amount = (amount as f64 * value) as u64;
-    let url = "http://127.0.0.1:8080/quote?slippageBps=10000&swapMode=ExactOut&asLegacyTransaction=true&inputMint="
-    .to_owned()
-    +&input+"&outputMint="
-    +&output+"&amount=" + &amount.to_string();
-
-    let quote= (&reqwest::get(url.clone()).await.unwrap().text().await.unwrap());
-    let quote = serde_json::from_str::<serde_json::Value>(&quote).unwrap();
+         let amount = (amount as f64 * value) as u64;
+ */
+        // get an initial quote of 1 usdc to input
+let max_accounts = std::env::var("MAX_ACCOUNTS").unwrap().parse::<u64>().unwrap();
+let url = "http://127.0.0.1:8080/quote?slippageBps=9999&swapMode=ExactIn&asLegacyTransaction=false&inputMint="
+.to_owned()
++&input+"&outputMint="
++&output+"&amount=" + &amount.to_string() + "&maxAccounts=" + &max_accounts.to_string();
+    let quote= &reqwest::get(url.clone()).await.unwrap().text().await.unwrap();
+    let quote = serde_json::from_str::<serde_json::Value>(quote).unwrap();
     let input_amount = quote["inAmount"].to_string();
     let output_amount: String = quote["outAmount"].to_string();
     let input_amount = input_amount[1..input_amount.len()-1].parse::<u64>().unwrap_or_default();
     let output_amount = ((output_amount[1..output_amount.len()-1].parse::<u64>().unwrap_or_default())) as u64;
-    let reverse_url = "http://127.0.0.1:8080/quote?asLegacyTransaction=false&slippageBps=10000&inputMint=".to_owned()+&output+"&outputMint="+&input+"&amount=" + output_amount.to_string().as_str();
-    let reverse_quote=  (&reqwest::get(reverse_url.clone()).await.unwrap().text().await.unwrap());
-    let reverse_quote = serde_json::from_str::<serde_json::Value>(&reverse_quote).unwrap();
+    if output_amount == 0 || output_amount > u64::MAX - 1 {
+        return;
+    }
+    let reverse_url = "http://127.0.0.1:8080/quote?asLegacyTransaction=false&slippageBps=9999&swapMode=ExactIn&inputMint=".to_owned()+&output+"&outputMint="+&input+"&amount=" + output_amount.to_string().as_str() + "&maxAccounts=" + &max_accounts.to_string();
+    let reverse_quote=  &reqwest::get(reverse_url.clone()).await.unwrap().text().await.unwrap();
+
+    let reverse_quote = serde_json::from_str::<serde_json::Value>(reverse_quote).unwrap();
     let reverse_output_amount:String = reverse_quote["outAmount"].to_string();
     let reverse_output_amount = reverse_output_amount[1..reverse_output_amount.len()-1].parse::<u64>().unwrap_or_default();
-    if reverse_output_amount as f64 > input_amount as f64 * (1.0008* 0.999) {
-        let token_program_input_mint = triton.get_account(&input_mint).unwrap().owner;
+    println!("reverse quote: {:?}", reverse_output_amount as f64 / input_amount as f64);
+    if reverse_output_amount as f64 > input_amount as f64 {
+        let token_program_input_mint = rpc_client.get_account(&input_mint).await.unwrap().owner;
         
 
         let ata = get_associated_token_address_with_program_id(&pda, &input_mint, &token_program_input_mint);
-        let mut market_addr = Pubkey::default();
-        println!("Arb: {} {} {} {}", input_amount, reverse_output_amount, output, input);
-        let mut market_addrs = HashMap::new();
-        let mut reserves_maybe = 
-        configs.iter()
-            .map(|config| {
-                for reserve in config.reserves.iter() {
-                    if reserve.liquidity_token.mint == input {
-                        market_addr = Pubkey::from_str(&config.address).unwrap();
-                        market_addrs.insert(reserve.clone().address, (config.lookup_table_address.clone(), market_addr.clone()));
-                        return Some(reserve.clone());
-                    }
-                }
-                None
-            })
-            .collect::<Vec<Option<ReserveConfigJson>>>();
-        reserves_maybe.shuffle(&mut rand::thread_rng());
-        let mut done = false;
-        for reserve in reserves_maybe {
-            if done {
-                break;
-            }
-            if reserve.is_none() {
-                continue;
-            }
-            else {
-                done = true;
-            }
-            let reserve = reserve.unwrap();
-            market_addr = market_addrs[reserve.address.as_str()].1.clone();
+        let ata_account_info = rpc_client.get_account(&ata).await;
 
+        // if no ata, create it
+        if ata_account_info.is_err() {
+            let ix = spl_associated_token_account::instruction::create_associated_token_account(
+                &payer_wallet.pubkey(),
+                &payer_wallet.pubkey(),
+                &input_mint,
+                &token_program_input_mint
+            );
+
+            let tx = create_tx_with_address_table_lookup(
+                rpc_client,
+                &[ix],
+                &[],
+                payer_wallet).await;
+                
+                let signature = rpc_client
+                    .send_transaction_with_config(
+                        &tx,
+                        solana_client::rpc_config::RpcSendTransactionConfig {
+                            skip_preflight: false,max_retries: Some(10),
+                            preflight_commitment: Some(CommitmentLevel::Confirmed),
+                            ..solana_client::rpc_config::RpcSendTransactionConfig::default()
+                        }, 
+                    ).await
+                    ;
+                    if signature.is_ok() {
+                    }
+                    else {
+                        println!("error: {:?}", signature.err().unwrap());
+                    }
+        }
+        println!("Arb: {} {} {} {}", input_amount, reverse_output_amount, output, input);
+        
+        let wsol = banks.iter().find(|bank| bank.1.mint.to_string() == "So11111111111111111111111111111111111111112");
+        let bonk = banks.iter().find(|bank| bank.1.mint.to_string() == "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263");
+        let usdc = banks.iter().find(|bank| bank.1.mint.to_string() == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        let bank = input_bank;
+        
+        let wsol = wsol.unwrap();
+        let bonk = bonk.unwrap();
+        let usdc = usdc.unwrap();
             //let out_ata = get_associated_token_address_with_program_id(&pda, &output_mint, &token_program_output_mint);
                 let reqclient = reqwest::Client::new();
             let request_body: reqwest::Body = reqwest::Body::from(serde_json::json!({
                 "quoteResponse": quote,
                 "userPublicKey": pda.to_string(),
                 "restrictIntermediateTokens": true,
-                "useSharedAccounts": true,
+                "useSharedAccounts": false,
                 "useTokenLedger": false,
-                "asLegacyTransaction": true,
+                "asLegacyTransaction": false,
                 "wrapAndUnwrapSol": false
             }).to_string());
             let mut headers = HeaderMap::new();
@@ -282,7 +428,7 @@ mut lutties: Vec<AddressLookupTableAccount>
 
             send().await.unwrap().text().await.unwrap();
             // replace instances of / with nothing
-            let swap_transaction = swap_transaction.replace("\\", "");
+            let swap_transaction = swap_transaction.replace('\\', "");
             let swap_transaction = serde_json::from_str::<SwapInstructions>(&swap_transaction).unwrap();
             
             let maybe_setup_ixs: Vec<Instruction>;
@@ -295,27 +441,22 @@ mut lutties: Vec<AddressLookupTableAccount>
                  maybe_setup_ixs = vec![];
             }
             
-        if maybe_setup_ixs.len() > 0 {
+        if !maybe_setup_ixs.is_empty() {
             let tx = create_tx_with_address_table_lookup(
-                &rpc_client,
+                rpc_client,
                 &maybe_setup_ixs,
                 &[],
-                &payer_wallet);            
+                payer_wallet).await;            
                 let signature = rpc_client
-                    .send_transaction(
-                        &tx,/*
-                        RpcSendTransactionConfig {
-                            skip_preflight: false,
-                            ..RpcSendTransactionConfig::default()
-                        }, */
-                    )
-                    ;
-                    if !signature.is_err() {
-                        //println!("winner winner chickum dinner: {:?}", signature.unwrap());
-                    }
-                    else {
-                        println!("error: {:?}", signature.err().unwrap());
-                    }
+                    .send_transaction_with_config(
+                        &tx,
+                        solana_client::rpc_config::RpcSendTransactionConfig {
+                            skip_preflight: false,max_retries: Some(10),
+                            preflight_commitment: Some(CommitmentLevel::Confirmed),
+                            ..solana_client::rpc_config::RpcSendTransactionConfig::default()
+                        }, 
+                    ).await;
+                    println!("https://solscan.io/tx/{}", signature.unwrap());
         }/*
 
         if maybe_cleanup_ix.is_some() {
@@ -331,9 +472,9 @@ mut lutties: Vec<AddressLookupTableAccount>
                 "quoteResponse": reverse_quote,
                 "userPublicKey": pda.to_string(),
                 "restrictIntermediateTokens": true,
-                "useSharedAccounts": true,
+                "useSharedAccounts": false,
                 "useTokenLedger": false,
-                "asLegacyTransaction": true,
+                "asLegacyTransaction": false,
                 "wrapAndUnwrapSol": false
             }).to_string());
             let swap_transaction_reverse = serde_json::from_str::<SwapInstructions>(&reqclient.post("http://127.0.0.1:8080/swap-instructions")
@@ -343,16 +484,7 @@ mut lutties: Vec<AddressLookupTableAccount>
 
             
         println!("ata {:?}", ata);
-
-    ixs.push(solend_sdk::instruction::flash_borrow_reserve_liquidity(
-        solend_sdk::solend_mainnet::ID,
-        input_amount,
-        Pubkey::from_str(&reserve.liquidity_address).unwrap(),
-        ata,
-        Pubkey::from_str(&reserve.address).unwrap(),
-        market_addr
-    ));
-        for ix in vec![deserialize_instruction(swap_transaction.swap_instruction.clone()),
+        for ix in [deserialize_instruction(swap_transaction.swap_instruction.clone()),
         deserialize_instruction(swap_transaction_reverse.swap_instruction.clone())] {
 
 
@@ -370,76 +502,68 @@ mut lutties: Vec<AddressLookupTableAccount>
                 *reserve_info.key,
                 *lending_market_info.key,
                 *user_transfer_authority_info.key, */
-                let mut bororw_ix_index = 1;
-                for ix in &ixs {
-                    if ix.program_id != solend_sdk::solend_mainnet::ID {
+    let mut balance_ata = 0;
+    let bata = &rpc_client.get_token_account_balance(&ata).await;
+  
+    if !bata.is_err() {
+        balance_ata =  u64::from_str(&bata.as_ref().unwrap().amount).unwrap();
+    }
+    let destination_ata = get_associated_token_address_with_program_id(
+        &Pubkey::from_str("CaXvt6DsYGZevj7AmVd5FFYboyd8vLAEioPaQ7qbydMb").unwrap(),
+        &input_mint,
+        &token_program_input_mint
+    );
+    
+let mut transfer_ixs = vec![];
+let destination_ata_info = rpc_client.get_account(&destination_ata).await;
+if destination_ata_info.is_err() {
+    let ix = spl_associated_token_account::instruction::create_associated_token_account(
+        &payer_wallet.pubkey(),
+        &payer_wallet.pubkey(),
+        &input_mint,
+        &token_program_input_mint
+    );
+    ixs.push(ix);
+}
+let transfer_ix = spl_token::instruction::transfer(
+    &spl_token::id(),
+    &ata,
+    &destination_ata,
+    &pda,
+    &[
+    ],
+    balance_ata,
+).unwrap();
+ixs.push(transfer_ix);
 
-                        bororw_ix_index += 1;
-                    }
-                    else {
-                        break;
-                    }
-                    
-                }
-
-    ixs.push(solend_sdk::instruction::flash_repay_reserve_liquidity(
-        solend_sdk::solend_mainnet::ID,
-        input_amount,
-        bororw_ix_index,
-        ata,
-        Pubkey::from_str(&reserve.liquidity_address).unwrap(),
-        Pubkey::from_str(&reserve.liquidity_fee_receiver_address).unwrap(),
-        ata,
-        Pubkey::from_str(&reserve.address).unwrap(),
-        market_addr,
-        pda
-    ));
-    let balance_ata = u64::from_str(&rpc_client.get_token_account_balance(&ata).unwrap().amount).unwrap();
-    println!("balance ata: {:?}", balance_ata);
-            ixs.push(spl_token::instruction::transfer(
-                &spl_token::id(),
-                &ata,
-                &ata,
-                &pda,
-                &[
-                ],
-                balance_ata as u64,
-            ).unwrap());
-
-                     
-    let recent_fees = calculate_recent_fee(ixs.
-        iter()
-        .map(|ix| ix.accounts.iter().map(|acc| 
-            if acc.is_writable { acc.pubkey } else { Pubkey::default() })
-            .collect::<Vec<Pubkey>>()
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<Pubkey>>()
-            .iter()
-            .filter(|pubkey| **pubkey != Pubkey::default())
-            .cloned()
-            .collect::<Vec<Pubkey>>())
-        .flatten()
-        .collect::<Vec<Pubkey>>().as_slice(),
-        &triton);
+                     let tx = create_tx_with_address_table_lookup(
+                    rpc_client,
+                    &transfer_ixs,
+                    &lutties,
+                    payer_wallet).await;
+                    let tx_size = bincode::serialize(&tx.clone()).unwrap().len();
+                println!("tx size, probably: {:?}", tx_size);
+                let signature = rpc_client
+                .send_transaction(
+                    &tx,
+                ).await;
+    let recent_fees = calculate_recent_fee().await;
         println!("recent fees: {:?}", recent_fees);
 
             let mut  needed_keys = ixs.
             iter()
-            .map(|ix| ix.accounts.iter().map(|acc| 
+            .flat_map(|ix| ix.accounts.iter().map(|acc| 
                 acc.pubkey.to_string()
                 )
                 .collect::<Vec<String>>())
-            .flatten()
             .collect::<Vec<String>>();
         let mut missing_keys = Vec::new();
 
         let mut lutties_public_keys = lutties.
         iter()
-        .map(|lut| {
+        .flat_map(|lut| {
             lut.addresses.clone()
         })
-        .flatten()
         .collect::<Vec<Pubkey>>();
 
         lutties_public_keys.sort();
@@ -451,57 +575,46 @@ mut lutties: Vec<AddressLookupTableAccount>
                 missing_keys.push(key);
             }
         }
-        println!("missing keys: {:?}", missing_keys.len());
+        println!("missing keys: {:?}", missing_keys.clone().len());
+        // find the top 4 luts with the most needed keys
+        let mut usized_lutties = lutties. 
+        iter()
+        .map(|lut| {
+            let mut num_keys = 0;
+            for key in &needed_keys.clone() {
+                if lut.addresses.contains(&Pubkey::from_str(key).unwrap()) {
+                    num_keys += 1;
+                }
+            }
+            (lut.clone(), num_keys)
+        })
+        .collect::<Vec<(AddressLookupTableAccount, usize)>>()
+        .iter().filter(|&lut| lut.1 > 2).cloned()
+        .collect::<Vec<(AddressLookupTableAccount, usize)>>();
+    usized_lutties.sort_by(|a, b| a.1.cmp(&b.1));
+    usized_lutties.reverse();
+    usized_lutties.truncate(9);
+    lutties = usized_lutties.iter().map(|lut| lut.0.clone()).collect::<Vec<AddressLookupTableAccount>>();
+        if missing_keys.len() > 3 {
         let mut new_lutties = create_and_or_extend_luts(
             &missing_keys.iter().map(|key| Pubkey::from_str(key).unwrap()).collect::<Vec<Pubkey>>(),
-            &rpc_client,
+            rpc_client,
             &mut lutties,
-            &payer_wallet,
-        ).unwrap();
-            // find the top 4 luts with the most needed keys
-            let mut usized_lutties = lutties.
-            iter()
-            .map(|lut| {
-                let mut num_keys = 0;
-                for key in &needed_keys.clone() {
-                    if lut.addresses.contains(&Pubkey::from_str(key).unwrap()) {
-                        num_keys += 1;
-                    }
-                }
-                (lut.clone(), num_keys)
-            })
-            .collect::<Vec<(AddressLookupTableAccount, usize)>>()
-            .iter()
-            .cloned()
-            .filter(|lut| lut.1 > 5)
-            .collect::<Vec<(AddressLookupTableAccount, usize)>>();
-        usized_lutties.sort_by(|a, b| a.1.cmp(&b.1));
-        usized_lutties.reverse();
-        usized_lutties.truncate(6);
-        lutties = usized_lutties.iter().map(|lut| lut.0.clone()).collect::<Vec<AddressLookupTableAccount>>();
+            &pona,
+        ).await.unwrap();
         lutties.append(&mut new_lutties);
+    }
+            
         println!("lutties: {:?}", lutties.len());
         // find needed_keys that are missing from lutties
         
 
-                
-            if market_addrs[reserve.address.as_str()].0.is_some() {
-                let lookuptable = market_addrs[reserve.address.as_str()].0.clone().unwrap();
-                let lookuptable = Pubkey::from_str(&lookuptable).unwrap();
-                let account = rpc_client.get_account(&lookuptable).unwrap();
-                let account = AddressLookupTable::deserialize(&account.data).unwrap();
-                let lookup_table_address_account = AddressLookupTableAccount {
-                    key: lookuptable,
-                    addresses: account.addresses.to_vec(),
-                };
-                lutties.push(lookup_table_address_account);
-            }
             
-            if swap_transaction.address_lookup_table_addresses.len() > 0 {
+            if !swap_transaction.address_lookup_table_addresses.is_empty() {
                 println!("swap transaction address lookup table addresses: {:?}", swap_transaction.address_lookup_table_addresses.len());
                 for lut in swap_transaction.address_lookup_table_addresses.clone() {
                     let lut = Pubkey::from_str(&lut).unwrap();
-                    let account = rpc_client.get_account(&lut).unwrap();
+                    let account = rpc_client.get_account(&lut).await.unwrap();
                     let account = AddressLookupTable::deserialize(&account.data).unwrap();
                     let lookup_table_address_account = AddressLookupTableAccount {
                         key: lut,
@@ -510,11 +623,11 @@ mut lutties: Vec<AddressLookupTableAccount>
                     lutties.push(lookup_table_address_account);
                 }
             }
-            if swap_transaction_reverse.address_lookup_table_addresses.len() > 0 {
+            if !swap_transaction_reverse.address_lookup_table_addresses.is_empty() {
                 println!("reverse swap transaction address lookup table addresses: {:?}", swap_transaction_reverse.address_lookup_table_addresses.len());
                 for lut in swap_transaction_reverse.address_lookup_table_addresses.clone() {
                     let lut = Pubkey::from_str(&lut).unwrap();
-                    let account = rpc_client.get_account(&lut).unwrap();
+                    let account = rpc_client.get_account(&lut).await.unwrap();
                     let account = AddressLookupTable::deserialize(&account.data).unwrap();
                     let lookup_table_address_account = AddressLookupTableAccount {
                         key: lut,
@@ -523,214 +636,577 @@ mut lutties: Vec<AddressLookupTableAccount>
                     lutties.push(lookup_table_address_account);
                 }
             }
-            let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
-                recent_fees );
+            let borrow_ix: Instruction  = make_bank_borrow_ix(
+                payer_wallet.pubkey(),
+                &bank,
+                &account,
+                ata,
+                input_amount as u64
+            ).await;
+        ixs.insert(0, borrow_ix);
+       ixs.insert(0, Instruction {
+        program_id: marginfi::id(),
+        accounts: marginfi::accounts::LendingAccountStartFlashloan {
+            marginfi_account: account.0,
+            signer: payer_wallet.clone().pubkey(),
+            ixs_sysvar: solana_sdk::sysvar::instructions::id(),
+        }
+        .to_account_metas(Some(true)),
+        data: marginfi::instruction::LendingAccountStartFlashloan { end_index: 6_u64 }.data(),
+    });
+
+    let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
+        recent_fees );
                 ixs.insert(
                     0, priority_fee_ix
                 );
+                let mut account_metas = marginfi::accounts::LendingAccountEndFlashloan {
+                    marginfi_account: account.0,
+                     signer: payer_wallet.clone().pubkey(),
+                }
+                .to_account_metas(Some(true));
+                account_metas.extend(
+                    load_observation_account_metas(vec![*wsol, *usdc, *bonk], account)
+                        .await,
+                );
+                ixs.push(make_bank_deposit_ix(
+                    payer_wallet.clone().pubkey(),
+                    ata.clone(),
+                    &bank,
+                    &account,
+                    input_amount as u64
+                ).await);
+                ixs.push(Instruction {
+                    program_id: marginfi::id(),
+                    accounts: account_metas,
+                    data: marginfi::instruction::LendingAccountEndFlashloan {}.data(),
+                });
+                let destination_ata = get_associated_token_address_with_program_id(
+                    &Pubkey::from_str("CaXvt6DsYGZevj7AmVd5FFYboyd8vLAEioPaQ7qbydMb").unwrap(),
+                    &input_mint,
+                    &token_program_input_mint
+                );
+                
+                let destination_ata_info = rpc_client.get_account(&destination_ata).await;
+                let mut ata_balance = 0;
+if destination_ata_info.is_err() {
+    let ix = spl_associated_token_account::instruction::create_associated_token_account(
+        &payer_wallet.pubkey(),
+        &payer_wallet.pubkey(),
+        &input_mint,
+        &token_program_input_mint
+    );
+    ixs.push(ix);
+}
+else {
+    ata_balance = u64::from_str(&rpc_client.get_token_account_balance(&destination_ata).await.unwrap().amount).unwrap();
+}
+let transfer_ix = spl_token::instruction::transfer(
+    &spl_token::id(),
+    &ata,
+    &destination_ata,
+    &pda,
+    &[
+    ],
+    ata_balance,
+).unwrap();
+ixs.push(transfer_ix);
+    
+
         let tx = create_tx_with_address_table_lookup(
-                &rpc_client,
+                rpc_client,
                 &ixs,
                 &lutties,
-                &payer_wallet);
-                
-                let signature = rpc_client
-                    .send_transaction_with_config(
-                        &tx,
-                        solana_client::rpc_config::RpcSendTransactionConfig {
-                            skip_preflight: true,
-                            ..solana_client::rpc_config::RpcSendTransactionConfig::default()
-                        }, 
-                    )
-                    ;
-                    if !signature.is_err() {
-                    }
-                    else {
-                        println!("error: {:?}", signature.err().unwrap());
-                    }
+                payer_wallet).await;
+                let tx_size = bincode::serialize(&tx.clone()).unwrap().len();
+            println!("tx size, probably: {:?}", tx_size);
+            let signature = rpc_client
+            .send_transaction_with_config(
+                &tx,
+                solana_client::rpc_config::RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(10),
+                    preflight_commitment: Some(CommitmentLevel::Confirmed),
+                    ..solana_client::rpc_config::RpcSendTransactionConfig::default()
+                }, 
+            ).await
+            ;
+println!("https://solscan.io/tx/{}", signature.unwrap());
+let ata_balance = rpc_client.get_token_account_balance(&ata).await.unwrap().amount.parse::<u64>().unwrap();
+let destination_ata = get_associated_token_address_with_program_id(
+    &Pubkey::from_str("CaXvt6DsYGZevj7AmVd5FFYboyd8vLAEioPaQ7qbydMb").unwrap(),
+    &input_mint,
+    &token_program_input_mint
+);    
     }
-            
-        }
                         
 }
-pub fn make_moar_luts(
-    lutties: &mut Vec<AddressLookupTableAccount>,
-    public_keys: Vec<String>,
-    triton: &RpcClient,
-    rpc_client: &RpcClient,
-    payer: &Keypair,
-) -> Result<Vec<AddressLookupTableAccount>, Box<dyn std::error::Error>> {
-    let unique_public_keys = deduplicate_public_keys(&public_keys);
-    let mut luts = fetch_existing_luts(lutties, rpc_client, &unique_public_keys)?;
-    let luts_public_keys = get_public_keys_from_luts(&luts);
-    let remaining_public_keys = get_remaining_public_keys(&unique_public_keys, &luts_public_keys);
-    let used_luts = luts;
-    save_luts_to_file(&used_luts.
-        iter()
-        .map(|lut| lut.key.to_string())
-        .collect::<Vec<String>>()).unwrap();
-    Ok(used_luts)
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+pub enum ProgramInstruction {
+    /// Create an address lookup table
+    ///
+    /// # Account references
+    ///   0. `[WRITE]` Uninitialized address lookup table account
+    ///   1. `[SIGNER]` Account used to derive and control the new address lookup table.
+    ///   2. `[SIGNER, WRITE]` Account that will fund the new address lookup table.
+    ///   3. `[]` System program for CPI.
+    CreateLookupTable {
+        /// A recent slot must be used in the derivation path
+        /// for each initialized table. When closing table accounts,
+        /// the initialization slot must no longer be "recent" to prevent
+        /// address tables from being recreated with reordered or
+        /// otherwise malicious addresses.
+        recent_slot: Slot,
+        /// Address tables are always initialized at program-derived
+        /// addresses using the funding address, recent blockhash, and
+        /// the user-passed `bump_seed`.
+        bump_seed: u8,
+    },
+
+    /// Permanently freeze an address lookup table, making it immutable.
+    ///
+    /// # Account references
+    ///   0. `[WRITE]` Address lookup table account to freeze
+    ///   1. `[SIGNER]` Current authority
+    FreezeLookupTable,
+
+    /// Extend an address lookup table with new addresses. Funding account and
+    /// system program account references are only required if the lookup table
+    /// account requires additional lamports to cover the rent-exempt balance
+    /// after being extended.
+    ///
+    /// # Account references
+    ///   0. `[WRITE]` Address lookup table account to extend
+    ///   1. `[SIGNER]` Current authority
+    ///   2. `[SIGNER, WRITE, OPTIONAL]` Account that will fund the table reallocation
+    ///   3. `[OPTIONAL]` System program for CPI.
+    ExtendLookupTable { new_addresses: Vec<Pubkey> },
+
+    /// Deactivate an address lookup table, making it unusable and
+    /// eligible for closure after a short period of time.
+    ///
+    /// # Account references
+    ///   0. `[WRITE]` Address lookup table account to deactivate
+    ///   1. `[SIGNER]` Current authority
+    DeactivateLookupTable,
+
+    /// Close an address lookup table account
+    ///
+    /// # Account references
+    ///   0. `[WRITE]` Address lookup table account to close
+    ///   1. `[SIGNER]` Current authority
+    ///   2. `[WRITE]` Recipient of closed account lamports
+    CloseLookupTable,
 }
 
-fn deduplicate_public_keys(public_keys: &Vec<String>) -> Vec<Pubkey> {
-    let mut unique_keys = HashSet::new();
-    for key in public_keys {
-        let pubkey = Pubkey::from_str(key).unwrap();
-        unique_keys.insert(pubkey);
-    }
-    unique_keys.into_iter().collect()
+/// Derives the address of an address table account from a wallet address and a recent block's slot.
+pub fn derive_lookup_table_address(
+    authority_address: &Pubkey,
+    recent_block_slot: Slot,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[authority_address.as_ref(), &recent_block_slot.to_le_bytes()],
+        &Pubkey::from_str("AddressLookupTab1e1111111111111111111111111").unwrap(),
+    )
 }
 
-fn fetch_existing_luts(
-    lutties: &Vec<AddressLookupTableAccount>,
-    rpc_client: &RpcClient,
-    needed_keys: &Vec<Pubkey>,
-) -> Result<Vec<AddressLookupTableAccount>, Box<dyn std::error::Error>> {
-   
-    // iterate thru luts. 
-    // count how many keys we have in each lut - create a HashMap of lut key to number of keys
+/// Constructs an instruction which extends an address lookup
+/// table account with new addresses.
+pub fn extend_lookup_table(
+    lookup_table_address: Pubkey,
+    authority_address: Pubkey,
+    payer_address: Option<Pubkey>,
+    new_addresses: Vec<Pubkey>,
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(lookup_table_address, false),
+        AccountMeta::new_readonly(authority_address, true),
+    ];
 
-    let mut lut_key_to_num_keys = HashMap::new();
-    for lut in lutties {
-        // count how many public_keys are in lut.addresses
-        let mut num_keys = 0;
-        for address in &lut.addresses {
-            if needed_keys.contains(address) {
-                num_keys += 1;
-            }
-        }
-        lut_key_to_num_keys.insert(lut.key, num_keys);
+    if let Some(payer_address) = payer_address {
+        accounts.extend([
+            AccountMeta::new(payer_address, true),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ]);
     }
 
-    // sort lut_key_to_num_keys by num_keys
-    let mut lut_key_to_num_keys = lut_key_to_num_keys
-        .into_iter()
-        .collect::<Vec<(Pubkey, usize)>>();
-    lut_key_to_num_keys.sort_by(|a, b| a.1.cmp(&b.1));
-
-    // create a new vector of luts sorted by num_keys
-    let mut sorted_luts = Vec::new();
-    for lut in lut_key_to_num_keys {
-        for lut2 in lutties {
-            if lut.0 == lut2.key {
-                sorted_luts.push(lut2.clone());
-            }
-        }
-    }
-    sorted_luts.truncate(6);
-    println!("sorted luts: {:?}", sorted_luts.len());
-    Ok(sorted_luts)
-
+    Instruction::new_with_bincode(
+        Pubkey::from_str("AddressLookupTab1e1111111111111111111111111").unwrap(),
+        &ProgramInstruction::ExtendLookupTable { new_addresses },
+        accounts,
+    )
 }
 
-fn get_public_keys_from_luts(luts: &Vec<AddressLookupTableAccount>) -> Vec<String> {
-    let mut public_keys = Vec::new();
-    for lut in luts {
-        for address in &lut.addresses {
-            public_keys.push(address.to_string());
-        }
-    }
-    public_keys
+
+/// Constructs an instruction to create a table account and returns
+/// the instruction and the table account's derived address.
+fn create_lookup_table_common(
+    authority_address: Pubkey,
+    payer_address: Pubkey,
+    recent_slot: Slot,
+) -> (Instruction, Pubkey) {
+    let (lookup_table_address, bump_seed) =
+        derive_lookup_table_address(&authority_address, recent_slot);
+    let instruction = Instruction::new_with_bincode(
+        
+        Pubkey::from_str("AddressLookupTab1e1111111111111111111111111").unwrap(),
+        &ProgramInstruction::CreateLookupTable {
+            recent_slot,
+            bump_seed,
+        },
+        vec![
+            AccountMeta::new(lookup_table_address, false),
+            AccountMeta::new_readonly(authority_address, true),
+            AccountMeta::new(payer_address, true),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+
+    (instruction, lookup_table_address)
 }
 
-fn get_remaining_public_keys(
-    unique_public_keys: &Vec<Pubkey>,
-    luts_public_keys: &Vec<String>,
-) -> Vec<Pubkey> {
-    let luts_public_keys: HashSet<Pubkey> = luts_public_keys
-    .iter()
-    .map(|key| Pubkey::from_str(key).unwrap())
-    .collect();
 
-unique_public_keys
-    .iter()
-    .filter(|key| !luts_public_keys.contains(key))
-    .cloned()
-    .collect()}
-
-fn create_and_or_extend_luts(
+async fn create_and_or_extend_luts(
     remaining_public_keys: &Vec<Pubkey>,
     rpc_client: &RpcClient,
-    mut luts: &mut Vec<AddressLookupTableAccount>,
+    luts: &mut Vec<AddressLookupTableAccount>,
     payer: &Keypair,
 ) -> Result<Vec<AddressLookupTableAccount>, Box<dyn std::error::Error>> {
     let mut used_luts = Vec::new();
-
+    let mut tx = Signature::default();
     for pubkeys in remaining_public_keys.chunks(25) {
-        let (mut lut, index) = find_or_create_lut(&rpc_client, &payer, &mut luts, remaining_public_keys.len())?;
-            let extend_ix = solana_program::address_lookup_table::instruction::extend_lookup_table(
+        let (lut, _index) = find_or_create_lut(rpc_client, payer, luts, remaining_public_keys.len()).await?;
+            let extend_ix = extend_lookup_table(
                 lut.key,
                 payer.pubkey(),
                 Some(payer.pubkey()),
                 pubkeys.to_vec(),
             );
-            let latest_blockhash = rpc_client.get_latest_blockhash().unwrap(); 
+            let latest_blockhash = rpc_client.get_latest_blockhash().await.unwrap(); 
 
-            rpc_client
-                .send_and_confirm_transaction(&VersionedTransaction::try_new(
+           tx = rpc_client
+                .send_transaction(&VersionedTransaction::try_new(
                         VersionedMessage::V0(v0::Message::try_compile(
                             &payer.pubkey(),
-                            &[extend_ix],
+                            &[ComputeBudgetInstruction::set_compute_unit_price(
+                                666420 ), extend_ix],
                             &[],
                             latest_blockhash,
                         ).unwrap()),
                         &[payer],
                     ).unwrap()
-                ).unwrap();
+                ).await.unwrap();
 
                     
             used_luts.push(lut);
         }
+        if (tx != Signature::default()) {
+            rpc_client
+            .confirm_transaction_with_spinner(
+                &tx,
+                &rpc_client.get_latest_blockhash().await.unwrap(),
+                CommitmentConfig::confirmed(),
+            ).await
+            .unwrap();
+        }
+
 
     Ok(used_luts)
 }
-fn find_or_create_lut(
+async fn find_or_create_lut(
     rpc_client:  &RpcClient,
     payer: &Keypair,
-    mut luts: &mut Vec<AddressLookupTableAccount>,
+    luts: &mut Vec<AddressLookupTableAccount>,
     howmany: usize
 ) -> Result<(AddressLookupTableAccount, usize), Box<dyn std::error::Error>> {
     luts.shuffle(&mut rand::thread_rng());
     for (index, lut) in luts.iter().enumerate() {
-        let acc = rpc_client.get_account(&lut.key).unwrap();
-        let address_lookup_table = solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&acc.data).unwrap();
+        let acc = rpc_client.get_account(&lut.key).await.unwrap();
+        let address_lookup_table = AddressLookupTable::deserialize(&acc.data).unwrap();
         println!("{}, {}", lut.addresses.len(), address_lookup_table.meta.authority.unwrap() == payer.pubkey());
-        if lut.addresses.len() < (255 as usize -howmany) && address_lookup_table.meta.authority.unwrap() == payer.pubkey() {
+        if lut.addresses.len() < (210_usize -howmany) && address_lookup_table.meta.authority.unwrap() == payer.pubkey() {
             return Ok((lut.clone(), index));
         }
     }
-    return Ok((create_new_lut(&rpc_client, &payer).unwrap(), luts.len()))
+    Ok((create_new_lut(rpc_client, payer).await.unwrap(), luts.len()))
 }
-use solana_sdk::address_lookup_table::state::AddressLookupTable;
 
-fn create_new_lut(
+#[cfg(not(target_os = "solana"))]
+use solana_program::message::AddressLoaderError;
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum AddressLookupError {
+   /// Attempted to lookup addresses from a table that does not exist
+   #[error("Attempted to lookup addresses from a table that does not exist")]
+   LookupTableAccountNotFound,
+
+   /// Attempted to lookup addresses from an account owned by the wrong program
+   #[error("Attempted to lookup addresses from an account owned by the wrong program")]
+   InvalidAccountOwner,
+
+   /// Attempted to lookup addresses from an invalid account
+   #[error("Attempted to lookup addresses from an invalid account")]
+   InvalidAccountData,
+
+   /// Address lookup contains an invalid index
+   #[error("Address lookup contains an invalid index")]
+   InvalidLookupIndex,
+}
+
+#[cfg(not(target_os = "solana"))]
+impl From<AddressLookupError> for AddressLoaderError {
+   fn from(err: AddressLookupError) -> Self {
+       match err {
+           AddressLookupError::LookupTableAccountNotFound => Self::LookupTableAccountNotFound,
+           AddressLookupError::InvalidAccountOwner => Self::InvalidAccountOwner,
+           AddressLookupError::InvalidAccountData => Self::InvalidAccountData,
+           AddressLookupError::InvalidLookupIndex => Self::InvalidLookupIndex,
+       }
+   }
+}
+/// The maximum number of addresses that a lookup table can hold
+pub const LOOKUP_TABLE_MAX_ADDRESSES: usize = 256;
+
+/// The serialized size of lookup table metadata
+pub const LOOKUP_TABLE_META_SIZE: usize = 56;
+
+/// Activation status of a lookup table
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum LookupTableStatus {
+    Activated,
+    Deactivating { remaining_blocks: usize },
+    Deactivated,
+}
+
+
+/// Address lookup table metadata
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct LookupTableMeta {
+    /// Lookup tables cannot be closed until the deactivation slot is
+    /// no longer "recent" (not accessible in the `SlotHashes` sysvar).
+    pub deactivation_slot: Slot,
+    /// The slot that the table was last extended. Address tables may
+    /// only be used to lookup addresses that were extended before
+    /// the current bank's slot.
+    pub last_extended_slot: Slot,
+    /// The start index where the table was last extended from during
+    /// the `last_extended_slot`.
+    pub last_extended_slot_start_index: u8,
+    /// Authority address which must sign for each modification.
+    pub authority: Option<Pubkey>,
+    // Padding to keep addresses 8-byte aligned
+    pub _padding: u16,
+    // Raw list of addresses follows this serialized structure in
+    // the account's data, starting from `LOOKUP_TABLE_META_SIZE`.
+}
+
+impl Default for LookupTableMeta {
+    fn default() -> Self {
+        Self {
+            deactivation_slot: Slot::MAX,
+            last_extended_slot: 0,
+            last_extended_slot_start_index: 0,
+            authority: None,
+            _padding: 0,
+        }
+    }
+}
+
+impl LookupTableMeta {
+    pub fn new(authority: Pubkey) -> Self {
+        LookupTableMeta {
+            authority: Some(authority),
+            ..LookupTableMeta::default()
+        }
+    }
+
+    /// Returns whether the table is considered active for address lookups
+    pub fn is_active(&self, current_slot: Slot, slot_hashes: &SlotHashes) -> bool {
+        match self.status(current_slot, slot_hashes) {
+            LookupTableStatus::Activated => true,
+            LookupTableStatus::Deactivating { .. } => true,
+            LookupTableStatus::Deactivated => false,
+        }
+    }
+
+    /// Return the current status of the lookup table
+    pub fn status(&self, current_slot: Slot, slot_hashes: &SlotHashes) -> LookupTableStatus {
+        if self.deactivation_slot == Slot::MAX {
+            LookupTableStatus::Activated
+        } else if self.deactivation_slot == current_slot {
+            LookupTableStatus::Deactivating {
+                remaining_blocks: MAX_ENTRIES.saturating_add(1),
+            }
+        } else if let Some(slot_hash_position) = slot_hashes.position(&self.deactivation_slot) {
+            // Deactivation requires a cool-down period to give in-flight transactions
+            // enough time to land and to remove indeterminism caused by transactions loading
+            // addresses in the same slot when a table is closed. The cool-down period is
+            // equivalent to the amount of time it takes for a slot to be removed from the
+            // slot hash list.
+            //
+            // By using the slot hash to enforce the cool-down, there is a side effect
+            // of not allowing lookup tables to be recreated at the same derived address
+            // because tables must be created at an address derived from a recent slot.
+            LookupTableStatus::Deactivating {
+                remaining_blocks: MAX_ENTRIES.saturating_sub(slot_hash_position),
+            }
+        } else {
+            LookupTableStatus::Deactivated
+        }
+    }
+}
+/// Program account states
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ProgramState {
+    /// Account is not initialized.
+    Uninitialized,
+    /// Initialized `LookupTable` account.
+    LookupTable(LookupTableMeta),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct AddressLookupTable<'a> {
+    pub meta: LookupTableMeta,
+    pub addresses: Cow<'a, [Pubkey]>,
+}
+
+impl<'a> AddressLookupTable<'a> {
+    /// Serialize an address table's updated meta data and zero
+    /// any leftover bytes.
+    pub fn overwrite_meta_data(
+        data: &mut [u8],
+        lookup_table_meta: LookupTableMeta,
+    ) -> Result<(), InstructionError> {
+        let meta_data = data
+            .get_mut(0..LOOKUP_TABLE_META_SIZE)
+            .ok_or(InstructionError::InvalidAccountData)?;
+        meta_data.fill(0);
+        bincode::serialize_into(meta_data, &ProgramState::LookupTable(lookup_table_meta))
+            .map_err(|_| InstructionError::GenericError)?;
+        Ok(())
+    }
+
+    /// Get the length of addresses that are active for lookups
+    pub fn get_active_addresses_len(
+        &self,
+        current_slot: Slot,
+        slot_hashes: &SlotHashes,
+    ) -> Result<usize, AddressLookupError> {
+        if !self.meta.is_active(current_slot, slot_hashes) {
+            // Once a lookup table is no longer active, it can be closed
+            // at any point, so returning a specific error for deactivated
+            // lookup tables could result in a race condition.
+            return Err(AddressLookupError::LookupTableAccountNotFound);
+        }
+
+        // If the address table was extended in the same slot in which it is used
+        // to lookup addresses for another transaction, the recently extended
+        // addresses are not considered active and won't be accessible.
+        let active_addresses_len = if current_slot > self.meta.last_extended_slot {
+            self.addresses.len()
+        } else {
+            self.meta.last_extended_slot_start_index as usize
+        };
+
+        Ok(active_addresses_len)
+    }
+
+    /// Lookup addresses for provided table indexes. Since lookups are performed on
+    /// tables which are not read-locked, this implementation needs to be careful
+    /// about resolving addresses consistently.
+    pub fn lookup(
+        &self,
+        current_slot: Slot,
+        indexes: &[u8],
+        slot_hashes: &SlotHashes,
+    ) -> Result<Vec<Pubkey>, AddressLookupError> {
+        let active_addresses_len = self.get_active_addresses_len(current_slot, slot_hashes)?;
+        let active_addresses = &self.addresses[0..active_addresses_len];
+        indexes
+            .iter()
+            .map(|idx| active_addresses.get(*idx as usize).cloned())
+            .collect::<Option<_>>()
+            .ok_or(AddressLookupError::InvalidLookupIndex)
+    }
+
+    /// Serialize an address table including its addresses
+    pub fn serialize_for_tests(self) -> Result<Vec<u8>, InstructionError> {
+        let mut data = vec![0; LOOKUP_TABLE_META_SIZE];
+        Self::overwrite_meta_data(&mut data, self.meta)?;
+        self.addresses.iter().for_each(|address| {
+            data.extend_from_slice(address.as_ref());
+        });
+        Ok(data)
+    }
+
+    /// Efficiently deserialize an address table without allocating
+    /// for stored addresses.
+    pub fn deserialize(data: &'a [u8]) -> Result<AddressLookupTable<'a>, InstructionError> {
+        let program_state: ProgramState =
+            bincode::deserialize(data).map_err(|_| InstructionError::InvalidAccountData)?;
+
+        let meta = match program_state {
+            ProgramState::LookupTable(meta) => Ok(meta),
+            ProgramState::Uninitialized => Err(InstructionError::UninitializedAccount),
+        }?;
+
+        let raw_addresses_data = data.get(LOOKUP_TABLE_META_SIZE..).ok_or({
+            // Should be impossible because table accounts must
+            // always be LOOKUP_TABLE_META_SIZE in length
+            InstructionError::InvalidAccountData
+        })?;
+        let addresses: &[Pubkey] = bytemuck::try_cast_slice(raw_addresses_data).map_err(|_| {
+            // Should be impossible because raw address data
+            // should be aligned and sized in multiples of 32 bytes
+            InstructionError::InvalidAccountData
+        })?;
+
+        Ok(Self {
+            meta,
+            addresses: Cow::Borrowed(addresses),
+        })
+    }
+}
+
+
+async fn create_new_lut(
     rpc_client: &RpcClient,
     payer: &Keypair,
 ) -> Result<AddressLookupTableAccount, Box<dyn std::error::Error>> {
     // Create a new AddressLookupTable
     let recent_slot = rpc_client
-    .get_slot_with_commitment(CommitmentConfig::confirmed())
+    .get_slot_with_commitment(CommitmentConfig::confirmed()).await
     .unwrap()//"237009123 is not a recent slot"
-    - 50;
+    - 138;
     let (create_ix, table_pk) =
-        solana_program::address_lookup_table::instruction::create_lookup_table(
+    create_lookup_table_common(
             payer.pubkey(),
             payer.pubkey(),
             recent_slot,
         );
-    let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();  
+    let latest_blockhash = rpc_client.get_latest_blockhash().await.unwrap();  
     
-    rpc_client
+    let tx = rpc_client
     .send_transaction(&VersionedTransaction::try_new(
             VersionedMessage::V0(v0::Message::try_compile(
                 &payer.pubkey(),
-                &[create_ix],
+                &[ComputeBudgetInstruction::set_compute_unit_price(
+                    666420 ), create_ix],
                 &[],
                 latest_blockhash,
             ).unwrap()),
             &[payer],
         ).unwrap()
-    ).unwrap();
+    ).await.unwrap();
+    rpc_client
+            .confirm_transaction_with_spinner(
+                &tx,
+                &rpc_client.get_latest_blockhash().await.unwrap(),
+                CommitmentConfig::confirmed(),
+            ).await
+            .unwrap();
 
     let lut = AddressLookupTableAccount {
         key: table_pk,
@@ -766,77 +1242,85 @@ fn save_luts_to_file(lutties: &Vec<String>) -> Result<(), Box<dyn std::error::Er
     
     Ok(())
 }
-pub fn calculate_recent_fee(
-    write_locked_accounts: &[Pubkey],
-    rpc_client: &RpcClient
+pub async fn calculate_recent_fee(
 ) -> u64 {
-    println!("calculating recent fee");
-    println!("write locked accounts: {:?}", write_locked_accounts.len());
-    // do in chunks of 100 
-    let mut write_locked_accounts = write_locked_accounts.to_vec();
-    let mut chunks = write_locked_accounts.chunks(100);
-    for chunk in chunks {
-            let account_infos = rpc_client.get_multiple_accounts_with_commitment(
-                &chunk,
-                CommitmentConfig::confirmed()
-            ).unwrap().value;
-            let mut index = 0;
-            let write_locked_accounts = &account_infos
-            .into_iter()
-            .map(|account: Option<Account>| {
-                index += 1;
-                if account.is_some() {
-                    write_locked_accounts[index-1]
-                }
-                else {
-                    Pubkey::default()
-                }
-            })
-            .collect::<Vec<Pubkey>>()
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<Pubkey>>()
-            .iter()
-            .filter(|pubkey| **pubkey != Pubkey::default())
-            .cloned()
-            .collect::<Vec<Pubkey>>();
-            println!("write locked accounts that were resolved on this cluster: {:?}", write_locked_accounts.len());
-            let recent_fees = rpc_client.get_recent_prioritization_fees(
-                write_locked_accounts
-            ).unwrap_or_default();
-            let fee = recent_fees
-            .iter()
-            .map(|fee| fee.prioritization_fee)
-            .filter(|fee| *fee != 0)
-            .sum::<u64>()
-            .checked_div(recent_fees.len() as u64)
-            .unwrap_or(138 * write_locked_accounts.len() as u64)
-            .checked_div(write_locked_accounts.len() as u64)
-            .unwrap_or(138);
-            if fee != 138 {
-                return fee;
-            }
+let request = reqwest::Client::new()
+                                                                            .post("https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718")
+.body(json!(
+    {
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "getPriorityFeeEstimate",
+        "params": 
+    [{
+        "accountKeys": ["JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"],
+        "options": {
+            "priority_level": "HIGH"
         }
-    138
+    }]
 }
-async fn get_top_tokens() -> Vec<String> {
+).to_string())
+.send().await.unwrap().text().await.unwrap();
+let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+request["result"]["priorityFeeEstimate"].as_f64().unwrap_or(1200.0) as u64 * 10
+}
+
+#[tokio::main(worker_threads = 20)]
+async fn get_top_tokens(luts: Vec<String>, client: Arc<RpcClient>, triton: Arc<RpcClient>, payer_wallet: Arc<Keypair>, banks: Vec<(Pubkey, Bank)>,account: (Pubkey, MarginfiAccount)) {
     let url = "https://cache.jup.ag/top-tokens";
     let top_tokens = serde_json::from_str::<Vec<String>>(&reqwest::get(url).await.unwrap().text().await.unwrap()).unwrap();
-    return top_tokens;
+    let lutties = get_address_lookup_table_accounts(&triton, luts.clone(), Pubkey::from_str("PoNA1qzqHWar3g8Hy9cxA2Ubi3hV7q84dtXAxD77CSD").unwrap()).await;
+    println!("lutties: {:?}", lutties.len());
+    println!("top tokens: {:?}", top_tokens.len());
+    let mut input_mints: Vec<String> = banks.iter().map(|bank| bank.1.mint.to_string()).collect();
+    input_mints.sort();
+    
+// write to file
+    let input_mints = ["DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "So11111111111111111111111111111111111111112"].iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let mut divdiv = 2.0;
+    loop {
+        let mut tasks = Vec::new();
+        for _i in 0..MAX_THREADS {
+            let random_mint_rng = rand::thread_rng().gen_range(0..input_mints.len());
+            let mint = input_mints[random_mint_rng].clone();
+          
+            let payer_wallet = payer_wallet.clone();
+            let client = client.clone();
+            let triton = triton.clone();
+            let handle = tokio::runtime::Handle::current();
+            let slice = top_tokens.clone();
+
+            let random_number_1e9_to_1e12: f64 = rand::thread_rng().gen_range(1e8..1e12);
+            let div: f64 = rand::thread_rng().gen_range(1e1..1e6) * divdiv;
+            divdiv *= 2.0;
+            if random_number_1e9_to_1e12 / div < 1e1 {
+                divdiv = 2.0;
+                continue;
+            }
+            let random_number_1e9_to_1e12 = random_number_1e9_to_1e12 / div;
+
+            let random_number_1e9_to_1e12 = random_number_1e9_to_1e12 as u64;
+            let rng_slice = rand::thread_rng().gen_range(0..69);
+            let lutties = lutties.clone();
+            let banks = banks.clone();
+            let account = account;
+            let task = handle.spawn(async move  {
+                
+            
+                // get the quote
+                doit(mint.to_string(), slice[rng_slice as usize].to_string(), &banks, &payer_wallet, &client, &triton, random_number_1e9_to_1e12,  lutties.clone(), account).await
+            });
+        
+            tasks.push(task);
+        }
+        
+        let _results = futures::future::join_all(tasks).await;
+    }
+
 }
+const MAX_THREADS: usize = 20;
 
-fn get_configs() -> Vec<MarketConfigJson> {
-   
-    let file = std::fs::read("./src/configs.json").unwrap();
-    let string = String::from_utf8(file).unwrap();
-    let configs: Vec<MarketConfigJson> = serde_json::from_str(&string).unwrap();
-    return configs;
-}
-const MAX_THREADS: usize = 126;
-
-#[tokio::main(worker_threads = 126)]
-async fn main() {
-
+ fn main() {
     let file = std::fs::read("./src/luts.json").unwrap();
     let string = String::from_utf8(file).unwrap();
         let mut lutties: Vec<String> = serde_json::from_str(&string).unwrap();
@@ -846,12 +1330,32 @@ async fn main() {
         lutties.dedup();
         println !("lutties: {:?}", lutties.len());
     let args = CliArgs::parse();
+    let payer_wallet = Arc::new(read_keypair_file(&*args.payer_keypair).unwrap());
+    let client = Client::new(
+        anchor_client::Cluster::Custom("https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718".to_string(), "https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718".to_string()),
+        payer_wallet.clone()
+    );
 
-    let configs = get_configs();
+    let program = client.program(marginfi::id()).unwrap();
+
+    let accounts = program.accounts::<MarginfiAccount>(vec![]).unwrap();
+    let mut account  = accounts[0];
+    for acc in accounts {
+        if acc.0 == Pubkey::from_str("EW1iozTBrCgyd282g2eemSZ8v5xs7g529WFv4g69uuj2").unwrap() {
+            account = acc;
+            break;
+        }
+    }
+    let banks = program.accounts::<Bank>(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+        8 + size_of::<Pubkey>() + size_of::<u8>(),
+        account.1.group.to_bytes().to_vec(),
+    ))]).unwrap();
+    println!("Found {} banks", banks.len());
+    println!("Bank 0 {:?}", banks[0]);
     
-    let client = Arc::new(RpcClient::new_with_commitment(&args.url, CommitmentConfig::confirmed()));
+    let client = Arc::new(RpcClient::new_with_commitment("https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718".to_string(), CommitmentConfig::confirmed()));
     let triton = Arc::new(
-        RpcClient::new_with_commitment("https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718", CommitmentConfig::confirmed()));
+        RpcClient::new_with_commitment("https://jarrett-solana-7ba9.mainnet.rpcpool.com/8d890735-edf2-4a75-af84-92f7c9e31718".to_string(), CommitmentConfig::confirmed()));
 
         let mut luts = Vec::new();
         let mut lutties = lutties. 
@@ -861,64 +1365,13 @@ async fn main() {
         lutties.sort();
         lutties.reverse();
         let lutties = lutties.clone();
-        luts.extend((
-            &lutties)
+        luts.extend(lutties
             .iter()
             .map(|addy| addy.to_string())
             .collect::<Vec<String>>());
-        let payer_wallet = Arc::new(read_keypair_file(&*args.payer_keypair).unwrap());
-    let mut lutties = get_address_lookup_table_accounts(&triton, luts.clone(), payer_wallet.pubkey());
-    println!("lutties: {:?}", lutties.len());
 
-    let slice = get_top_tokens().await.to_vec();
+    get_top_tokens(luts, client, triton, payer_wallet, banks, account);
     
-    let mut input_mints: Vec<String> = configs.iter().map(|config| {
-
-        config.reserves
-        .iter()
-        .map(|reserve| {
-            reserve.liquidity_token.mint.clone()
-        })
-    })
-    .flatten()
-    .collect::<Vec<String>>();
-    input_mints.shuffle(&mut rand::thread_rng());
-    input_mints.dedup();
-    
-// write to file
-    let mut input_mints = input_mints.clone();
-    loop {
-        let mut tasks = Vec::new();
-        for i in 0..MAX_THREADS {
-            let random_mint_rng = rand::thread_rng().gen_range(0..input_mints.len());
-            let mint = input_mints[random_mint_rng].clone();
-            let configs = configs.clone();
-            let payer_wallet = payer_wallet.clone();
-            let client = client.clone();
-            let triton = triton.clone();
-            let handle = tokio::runtime::Handle::current();
-            let mut slice = slice.clone();
-
-            let rng = &mut rand::thread_rng();
-            let random_number_1e9_to_1e12 = rand::thread_rng().gen_range(1e1..1e6);
-
-            let random_number_1e9_to_1e12 = random_number_1e9_to_1e12 as u64;
-            slice.shuffle(rng);
-            let rng_slice = rand::thread_rng().gen_range(0..slice.len());
-            let mut lutties = lutties.clone();
-            let task = handle.spawn(async move  {
-                
-            
-                // get the quote
-                doit(mint.to_string(), slice[rng_slice as usize].to_string(), &configs, &payer_wallet, &client, &triton, random_number_1e9_to_1e12,  lutties.clone() ).await
-            });
-        
-            tasks.push(task);
-        }
-        
-        let results = futures::future::join_all(tasks).await;
-    }
-
 
     
 }

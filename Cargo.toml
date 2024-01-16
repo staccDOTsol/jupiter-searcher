@@ -1,5 +1,5 @@
 [workspace]
-members = ["programs/jupiter_searcher", "switchboard-functions/jupiter-searcher"]
+members = [ "switchboard-functions/jupiter-searcher"]
 
 [profile.release]
 overflow-checks = true

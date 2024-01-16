@@ -16,6 +16,6 @@ cpi = []
 default = []
 
 [dependencies]
-anchor-lang = "0.29"
-anchor-spl = "0.29.0"
+anchor-lang = "0.28"
+anchor-spl = "0.28.0"
 jupiter-cpi = { path = "../../deps/jupiter-cpi" }
