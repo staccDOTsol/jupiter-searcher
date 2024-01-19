@@ -29,11 +29,6 @@ shellexpand = "3.1.0"
 round = "0.1.2"
 anyhow = "1.0.75"
 async-recursion = "1.0.5"
-marginfi = { path = "../../../marginfi-v2/programs/marginfi" , features = [
-    "mainnet-beta",
-    "client",
-    "no-entrypoint",
-] }
 anchor-client = "0.28.0"
 bytemuck = "1.14.0"
 thiserror = "1.0.56"
